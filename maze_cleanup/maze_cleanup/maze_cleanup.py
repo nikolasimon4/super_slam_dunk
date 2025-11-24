@@ -10,6 +10,8 @@ import cv_bridge
 import numpy as np
 import os
 import time
+import math
+import heapq
 
 
 # CONSTANTS
@@ -43,6 +45,8 @@ class ObjectCollector(Node):
         self.robot_state = INIT
         self.map_loaded = False
         self.map = None
+        self.inflated_map = None # Map that has inflated walls to improve A* pathing
+        self.inflation_radius = 0.2 # Tunable for how much inflation we want  
 
         # Object tracking
         self.object_positions = {"blue": None, "green": None, "pink": None}
@@ -240,7 +244,194 @@ class ObjectCollector(Node):
         msg.linear.x = float(lin)
         msg.angular.z = float(ang)
         self.cmd_pub.publish(msg)
+        
+    def build_inflated_map(self):
+        """
+        Build an A* inflated map to make sure pathing stays away from walls.
+        """
+        if self.map is None:
+            self.get_logger().error("No map available to build inflated map.")
+            return
 
+        width = self.map.info.width
+        height = self.map.info.height
+        res = self.map.info.resolution
+        data = self.map.data
+
+        inflated = [0] * (width * height)
+
+        
+        # Copy map obstacles
+        for i, v in enumerate(data):
+            if v != 0:
+                inflated[i] = 100
+
+        # Determine inflation radius in cells
+        radius_cells = int(self.inflation_radius / res)
+        if radius_cells <= 0:
+            self.inflated_map = inflated
+            return
+
+        # Inflate obstacles
+        for y in range(height):
+            for x in range(width):
+                idx = y * width + x
+                if inflated[idx] == 100:
+                    for dy in range(-radius_cells, radius_cells + 1):
+                        for dx in range(-radius_cells, radius_cells + 1):
+                            nx = x + dx
+                            ny = y + dy
+                            if 0 <= nx < width and 0 <= ny < height:
+                                nidx = ny * width + nx
+                                inflated[nidx] = 100
+
+        self.inflated_map = inflated
+        self.get_logger().info("Inflated A* map built")
+
+    def get_neighbors_1d(self, idx):
+        """Return indexes of 8 neighbors."""
+        width = self.map.info.width
+        height = self.map.info.height
+
+        neighbors = []
+        x = idx % width
+        y = idx // width
+
+        # (dx, dy) directions
+        deltas = [
+            (-1,  0), (1,  0),      # left, right
+            (0, -1), (0,  1),       # up, down
+            (-1, -1), (1, -1),      # diag up-left, up-right
+            (-1,  1), (1,  1)       # diag down-left, down-right
+        ]
+
+        for dx, dy in deltas:
+            nx = x + dx
+            ny = y + dy
+            if 0 <= nx < width and 0 <= ny < height:
+                neighbors.append(ny * width + nx)
+
+        return neighbors
+
+
+
+    def astar_indices(self, start_idx, goal_idx):
+        """
+        A* search, returns path in indexes on map.
+        """
+        width  = self.map.info.width
+        height = self.map.info.height
+
+        # Make sure inflated map is built
+        if self.inflated_map is None:
+            self.build_inflated_map()
+
+        # Bounds check
+        if not (0 <= start_idx < width * height) or not (0 <= goal_idx < width * height):
+            self.get_logger().error("Start or goal index out of bounds.")
+            return []
+
+        # Collision check
+        if self.inflated_map[start_idx] == 100:
+            self.get_logger().error("Start index is an obstacle.")
+            return []
+        if self.inflated_map[goal_idx] == 100:
+            self.get_logger().error("Goal index is an obstacle.")
+            return []
+
+        # A* structures
+        open_heap = []
+        heap_counter = 0
+        heapq.heappush(open_heap, (0.0, heap_counter, start_idx))
+
+        g_cost = {start_idx: 0.0}
+        came_from = {}
+        
+        # Storage for last move
+        last_move = {start_idx: (0, 0)}
+
+        closed = set()
+
+        sqrt2 = math.sqrt(2.0)
+
+        def heuristic(i):
+            """Heuristic for distance finding"""
+            x1 = i % width
+            y1 = i // width
+            x2 = goal_idx % width
+            y2 = goal_idx // width 
+            dx = abs(x2 - x1)
+            dy = abs(y2 - y1)
+            return (dx + dy)
+
+        while open_heap:
+            _, _, current = heapq.heappop(open_heap)
+            if current in closed:
+                continue
+            closed.add(current)
+
+            if current == goal_idx:
+                return self.reconstruct_indices_path(came_from, goal_idx)
+
+            cx = current % width
+            cy = current // width
+
+            for nb in self.get_neighbors_1d(current):
+                if self.inflated_map[nb] == 100:
+                    continue
+
+                nx = nb % width
+                ny = nb // width
+
+                dx = nx - cx
+                dy = ny - cy
+
+                # Detect diagonal move
+                diag = (abs(dx) == 1 and abs(dy) == 1)
+
+                # Prevent corner-cutting
+                if diag:
+                    mid1_x, mid1_y = cx + dx, cy      
+                    mid2_x, mid2_y = cx, cy + dy 
+                    mid1_idx = mid1_y * width + mid1_x
+                    mid2_idx = mid2_y * width + mid2_x
+
+                    if (self.inflated_map[mid1_idx] == 100 or
+                        self.inflated_map[mid2_idx] == 100):
+                        continue
+
+                base_cost = sqrt2 if diag else 1.0
+
+                # Direction change penalty
+                prev_dx, prev_dy = last_move.get(current, (0, 0))
+                turn_penalty = 0.0
+                if (prev_dx, prev_dy) != (0, 0) and (dx, dy) != (prev_dx, prev_dy):
+                    turn_penalty = 0.1
+
+                new_g = g_cost[current] + base_cost + turn_penalty
+
+                if nb not in g_cost or new_g < g_cost[nb]:
+                    g_cost[nb] = new_g
+                    came_from[nb] = current
+                    last_move[nb] = (dx, dy)
+
+                    f = new_g + heuristic(nb)
+                    heap_counter += 1
+                    heapq.heappush(open_heap, (f, heap_counter, nb))
+
+        self.get_logger().warn("A* found no path.")
+        return []
+
+    def reconstruct_indices_path(self, came_from, goal_idx):
+        """Return a list of 1D indices representing the path."""
+        path = []
+        cur = goal_idx
+        while cur in came_from:
+            path.append(cur)
+            cur = came_from[cur]
+        path.append(cur)
+        path.reverse()
+        return path
 
 
 # maib
