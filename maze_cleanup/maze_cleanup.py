@@ -35,9 +35,11 @@ class ObjectCollector(Node):
 
     def __init__(self):
         super().__init__('maze_object_collector')
-        
-        ros_domain_id = os.getenv("ROS_DOMAIN_ID")
-        self.get_logger().info(f"ROS_DOMAIN_ID: {ros_domain_id}")
+
+        # Pull turtlebot number and pad with leading zero if needed
+        unformatted = os.getenv('ROS_DOMAIN_ID')
+        ros_domain_id = f'{int(unformatted):02d}'
+        self.get_logger().info(f'ROS_DOMAIN_ID: {ros_domain_id}')
 
         self.bridge = cv_bridge.CvBridge()
 
@@ -51,6 +53,12 @@ class ObjectCollector(Node):
         # Object tracking
         self.object_positions = {"blue": None, "green": None, "pink": None}
         self.objects_found    = {"blue": False, "green": False, "pink": False}
+        
+        # Runtime state variables
+        self.target_object = None
+        self.current_path = []
+        self.has_object = False
+        self.robot_pose = None
 
         # Subscribers
         self.create_subscription(
@@ -59,14 +67,12 @@ class ObjectCollector(Node):
             self.get_map_callback,
             10
         )
-
         self.create_subscription(
             LaserScan,
             f"/tb{ros_domain_id}/scan",
             self.scan_callback,
             10
         )
-
         self.create_subscription(
             CompressedImage,
             f"/tb{ros_domain_id}/oakd/rgb/preview/image_raw/compressed",
@@ -86,7 +92,6 @@ class ObjectCollector(Node):
 
         self.get_logger().info("ObjectCollector Node Initialized")
 
-
     # Map loading
     def get_map_callback(self, msg: OccupancyGrid):
         """Receive a SLAM map from /map and store it."""
@@ -95,7 +100,6 @@ class ObjectCollector(Node):
             self.map_loaded = True
             self.get_logger().info("SLAM map received from /map.")
 
-
     # Scan and image callbacks
     def scan_callback(self, msg):
         pass
@@ -103,8 +107,6 @@ class ObjectCollector(Node):
     def image_callback(self, msg):
         img = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
         pass
-
-
 
     # State machine
     def state_machine_step(self):
@@ -151,14 +153,11 @@ class ObjectCollector(Node):
         elif self.robot_state == TASK_COMPLETE:
             self.handle_task_complete()
 
-
-
     # State handlers
 
     def handle_init(self):
         self.get_logger().info("INIT → LOAD_SLAM_MAP")
         self.robot_state = LOAD_SLAM_MAP
-
 
     def handle_load_slam_map(self):
         """Wait until the /map subscription delivers the SLAM map."""
@@ -169,7 +168,6 @@ class ObjectCollector(Node):
         self.get_logger().info("SLAM map loaded. Proceeding to localization.")
         self.robot_state = LOCALIZE_WITH_FILTER
 
-
     def handle_particle_filter_localization(self):
         self.get_logger().info("Running particle filter localization...")
         # TODO: Integrate PF results
@@ -177,74 +175,62 @@ class ObjectCollector(Node):
         if localization_done:
             self.robot_state = WALL_FOLLOW
 
-
     def handle_wall_follow(self):
         self.get_logger().info("Wall following...")
         # TODO: Wall follower implementation
         pass
 
-
     def handle_observe_object(self):
         self.get_logger().info("Observing object...")
         pass
-
 
     def handle_wait_for_target(self):
         if self.target_object is not None:
             self.robot_state = PLAN_PATH_TO_OBJECT
 
-
     def handle_plan_to_object(self):
         self.current_path = []
         self.robot_state = NAVIGATE_TO_OBJECT
-
 
     def handle_navigate_to_object(self):
         arrived = False
         if arrived:
             self.robot_state = ALIGN_WITH_OBJECT
 
-
     def handle_align_with_object(self):
         refined = True
         if refined:
             self.robot_state = PICK_UP_OBJECT
 
-
     def handle_pick_up_object(self):
         self.has_object = True
         self.robot_state = PLAN_PATH_TO_BIN
 
-
     def handle_plan_to_bin(self):
         self.current_path = []
         self.robot_state = NAVIGATE_TO_BIN
-
 
     def handle_navigate_to_bin(self):
         arrived = False
         if arrived:
             self.robot_state = DROP_OBJECT
 
-
     def handle_drop_object(self):
         self.has_object = False
         self.robot_state = TASK_COMPLETE
-
 
     def handle_task_complete(self):
         self.get_logger().info("Task complete.")
         self.publish_velocity(0.0, 0.0)
 
-
-
-    # helper functions here 
+    # Helper functions
+ 
     def publish_velocity(self, lin, ang):
         msg = Twist()
         msg.linear.x = float(lin)
         msg.angular.z = float(ang)
         self.cmd_pub.publish(msg)
-        
+
     def build_inflated_map(self):
         """
         Build an A* inflated map to make sure pathing stays away from walls.
@@ -260,7 +246,6 @@ class ObjectCollector(Node):
 
         inflated = [0] * (width * height)
 
-        
         # Copy map obstacles
         for i, v in enumerate(data):
             if v != 0:
@@ -314,7 +299,6 @@ class ObjectCollector(Node):
         return neighbors
 
 
-
     def astar_indices(self, start_idx, goal_idx):
         """
         A* search, returns path in indexes on map.
@@ -346,7 +330,7 @@ class ObjectCollector(Node):
 
         g_cost = {start_idx: 0.0}
         came_from = {}
-        
+
         # Storage for last move
         last_move = {start_idx: (0, 0)}
 
@@ -419,7 +403,7 @@ class ObjectCollector(Node):
                     heap_counter += 1
                     heapq.heappush(open_heap, (f, heap_counter, nb))
 
-        self.get_logger().warn("A* found no path.")
+        self.get_logger().warning("A* found no path.")
         return []
 
     def reconstruct_indices_path(self, came_from, goal_idx):
