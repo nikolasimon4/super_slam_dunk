@@ -27,17 +27,6 @@ ros2 launch maze_cleanup particle_filter_launch.py namespace:=/tbXX
 ```bash
 ros2 run maze_cleanup maze-cleanup
 ```
-
-## What to Expect
-
-- **Startup**: 500 particles scattered across free space
-- **Moving**: Particles converge toward robot's true location
-- **Converged**: Tight cluster + accurate pose estimate
-
-## Environment
-
-Set `ROS_DOMAIN_ID` to your robot number before running.
-
 ## Topics
 
 | Topic | Description |
