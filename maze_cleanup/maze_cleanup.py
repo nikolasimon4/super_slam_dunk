@@ -189,8 +189,24 @@ class ObjectCollector(Node):
             self.robot_state = PLAN_PATH_TO_OBJECT
 
     def handle_plan_to_object(self):
-        self.current_path = []
-        self.robot_state = NAVIGATE_TO_OBJECT
+        """Plan path from current robot pose to target object."""
+        if self.robot_pose is None or self.target_object is None:
+            self.get_logger().error("Cannot plan: missing robot_pose or target_object")
+            return
+        
+        goal = self.object_positions.get(self.target_object)
+        if goal is None:
+            self.get_logger().error(f"No position for target: {self.target_object}")
+            return
+        
+        self.current_path = self.plan_path(self.robot_pose, goal)
+        
+        if self.current_path:
+            self.get_logger().info(f"Path to {self.target_object}: {len(self.current_path)} waypoints")
+            self.robot_state = NAVIGATE_TO_OBJECT
+        else:
+            self.get_logger().error("Failed to plan path to object")
+            # TODO: handle failure (eg go back to exploration)
 
     def handle_navigate_to_object(self):
         arrived = False
@@ -207,8 +223,27 @@ class ObjectCollector(Node):
         self.robot_state = PLAN_PATH_TO_BIN
 
     def handle_plan_to_bin(self):
-        self.current_path = []
-        self.robot_state = NAVIGATE_TO_BIN
+        """Plan path from current robot pose to the appropriate bin."""
+        if self.robot_pose is None:
+            self.get_logger().error("Cannot plan: missing robot_pose")
+            return
+        
+        # TODO: determine bin position based on object color
+        bin_position = None  # like self.bin_positions["trash"] or ["recycling"]
+        
+        if bin_position is None:
+            self.get_logger().warning("Bin position not set, skipping to navigate")
+            self.current_path = []
+            self.robot_state = NAVIGATE_TO_BIN
+            return
+        
+        self.current_path = self.plan_path(self.robot_pose, bin_position)
+        
+        if self.current_path:
+            self.get_logger().info(f"Path to bin: {len(self.current_path)} waypoints")
+            self.robot_state = NAVIGATE_TO_BIN
+        else:
+            self.get_logger().error("Failed to plan path to bin")
 
     def handle_navigate_to_bin(self):
         arrived = False
@@ -416,7 +451,6 @@ class ObjectCollector(Node):
         path.append(cur)
         path.reverse()
         return path
-
 
 def main(args=None):
     rclpy.init(args=args)
