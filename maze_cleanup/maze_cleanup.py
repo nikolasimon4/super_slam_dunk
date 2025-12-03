@@ -17,7 +17,11 @@ import math
 import heapq
 import transforms3d.euler as euler
 import transforms3d.quaternions as quat
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
+from omx_cpp_interface.msg import ArmGripperPosition
+from control_msgs.action import GripperCommand
+from rclpy.action import ActionClient
 
 
 # Helper functions
@@ -26,6 +30,28 @@ def get_yaw_from_pose(p: Pose):
     q = [p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z]
     yaw = euler.quat2euler(q, axes="sxyz")[2]
     return yaw
+
+# Picking up joint positions
+PICK_JOINT1 = 0.0
+PICK_JOINT2 = 0.5
+PICK_JOINT3 = -0.350
+PICK_JOINT4 =  0.0
+
+
+# Stowed joint positions
+STOW_JOINT1 = 0.0
+STOW_JOINT2 = -0.7
+STOW_JOINT3 = -0.350
+STOW_JOINT4 =  0.0
+
+
+# Values for opening/closing the gripper
+GRIPPER_OPEN = .009
+GRIPPER_CLOSED = -.009
+
+# Arrays to pass into function to make pos passing easier
+ARM_PICK_UP_JOINT = [PICK_JOINT1, PICK_JOINT2, PICK_JOINT3, PICK_JOINT4]
+ARM_STOW_JOINT = [STOW_JOINT1, STOW_JOINT2, STOW_JOINT3, STOW_JOINT4]
 
 # CONSTANTS
 INIT                           = "INIT"
@@ -36,6 +62,7 @@ OBSERVE_OBJECT                 = "OBSERVE_OBJECT"
 WAIT_FOR_TARGET                = "WAIT_FOR_TARGET"
 PLAN_PATH_TO_OBJECT            = "PLAN_PATH_TO_OBJECT"
 NAVIGATE_TO_OBJECT             = "NAVIGATE_TO_OBJECT"
+MOVE_TO_SEEN                   = "MOVE_TO_SEEN"
 ALIGN_WITH_OBJECT              = "ALIGN_WITH_OBJECT"
 PICK_UP_OBJECT                 = "PICK_UP_OBJECT"
 PLAN_PATH_TO_BIN               = "PLAN_PATH_TO_BIN"
@@ -61,12 +88,17 @@ class ObjectCollector(Node):
         self.desired_distance = .25 # Desired dist from wall when following
         self.recent_scan = None
         self.counter = 0
+        self.countdown = 1000
         # State machine
+        self.objects_count = 0
         self.robot_state = INIT
         self.map_loaded = False
         self.map = None
         self.inflated_map = None # Map that has inflated walls to improve A* pathing
         self.inflation_radius = 0.2 # Tunable for how much inflation we want  
+        
+        
+        self.desired_distance_color = .35 # Desired distance from colored object before picking up (used for approaching object)
 
         # Object tracking
         self.object_positions = {"blue": None, "green": None, "pink": None}
@@ -171,7 +203,14 @@ class ObjectCollector(Node):
         self.closest_object_forward = self.find_closest_object_angle(msg,-math.pi/8,math.pi/8)
         self.closest_object_left = self.find_closest_object_angle(msg,-3 * math.pi / 4, -1 * math.pi/4)
         self.recent_scan = msg
+        
+        
+        
         if(self.robot_state == LOCALIZE_WITH_FILTER or self.robot_state == WALL_FOLLOW):
+            if(self.objects_count == 3 and self.countdown <= 0):
+                self.robot_state = PLAN_PATH_TO_OBJECT
+                self.target_object = "pink"
+                return 
             self.wall_follow_publish()
         if(self.robot_state == OBSERVE_OBJECT and self.target_object and not self.detected_objects[self.target_object]['found']):
             self.get_logger().info(f"GETTING OBJECT {self.target_object}")
@@ -192,16 +231,20 @@ class ObjectCollector(Node):
                     ob_pose = Pose()
                     ob_pose.orientation = self.robot_pose.orientation
                     ob_pose.position = self.robot_pose.position
-                    yaw = get_yaw_from_pose(self.robot_pose)
-                    ob_pose.position.x += math.cos(yaw) * dist
-                    ob_pose.position.y += math.sin(yaw) * dist
                     self.object_positions[self.target_object] = ob_pose
                     self.get_logger().info(f"GOT OBJECT {self.target_object} POSITION {ob_pose.position.x},{ob_pose.position.y} DISTANCE {dist}")
-
+                    self.objects_count += 1
                     self.target_object = None
                     self.robot_state = WALL_FOLLOW
                     return
-                
+        forward_obj_ang, forward_obj_dist = self.find_closest_object_angle(msg,-math.pi/20,math.pi/20)
+
+        # If the robot is approaching and within the desired distance stops the robot and updates the state
+        if (self.robot_state == MOVE_TO_SEEN and forward_obj_dist < self.desired_distance_color):
+            
+            self.robot_state = PICK_UP_OBJECT
+            self.publish_velocity(0.0,0.0)
+            return         
     # State machine
     def state_machine_step(self):
 
@@ -268,13 +311,14 @@ class ObjectCollector(Node):
             localization_done = True
         else:
             self.counter += 1
-            self.publish_velocity(.1,0) 
+            self.publish_veglocity(.1,0) 
             localization_done = False
         if localization_done:
             self.robot_state = WALL_FOLLOW
 
     def handle_wall_follow(self):
-        # TODO: Wall follower implementation
+        if(self.objects_count == 3):
+            self.countdown -= 1
         pass
 
     def handle_observe_object(self):
@@ -306,9 +350,19 @@ class ObjectCollector(Node):
             # TODO: handle failure (eg go back to exploration)
 
     def handle_navigate_to_object(self):
-        arrived = False
-        if arrived:
-            self.robot_state = ALIGN_WITH_OBJECT
+        pass
+    def handle_move_to_seen_object(self):
+        # Finds position of object/tag relative to robot in image
+        if self.target_object is not None and self.detected_objects[self.target_object]['found']:
+            cx = self.detected_objects[self.target_object]['cx'] - self.image_width / 2
+        else:
+            cx = 0
+            self.get_logger().info(f"Object/tag not found, target obj {self.target_object}, target tag: {self.target_tag}")
+        # Moves robot forward
+        self.publish_velocity(.1 , 0)
+        time.sleep(.1)
+        # Attempts to move slowly to keep robot aligned to object
+        self.publish_velocity(0, -(cx / 50))
 
     def handle_align_with_object(self):
         refined = True
@@ -316,6 +370,10 @@ class ObjectCollector(Node):
             self.robot_state = PICK_UP_OBJECT
 
     def handle_pick_up_object(self):
+        # Closes gripper
+        self.send_gripper_command(GRIPPER_CLOSED)
+        # Stows gripper
+        self.publish_joint_angles(ARM_STOW_JOINT)
         self.has_object = True
         self.robot_state = PLAN_PATH_TO_BIN
 
@@ -550,7 +608,50 @@ class ObjectCollector(Node):
         return path
     
     
-    
+    ### GRIPPER HELPERS
+    def send_gripper_command(self, position, effort=1.0):
+        """
+        sends command to gripper to move to given position with given effort
+
+        Args:
+            position (int): Position of gripper (see constants above)
+            effort (float, optional): Torque value, default 1 is fine. Defaults to 1.0.
+        """
+        goal = GripperCommand.Goal()
+        goal.command.position = position 
+        goal.command.max_effort = effort 
+        self.get_logger().info(f'Sending gripper command: position={position}')
+        self.gripper_pub.send_goal_async(goal)
+        time.sleep(2)        
+
+    def publish_joint_angles(self, joint_angles, duration=1.0):
+        """Publishes given joint angles to arm
+
+        Args:
+            joint_angles (list of joint angles): list of joint angles to be published in order (j1,j2...)
+            duration (float, optional): Duration of movement, default is good enough. Defaults to 1.0.
+        """
+        
+        # If the joint angle input doesn't match to expected names, prints an error
+        if len(joint_angles) != len(self.joint_names):
+            self.get_logger().error(f"Expected {len(self.joint_names)} joint angles, got {len(joint_angles)}")
+            return
+
+        # Constructing joint_trajectory message
+        msg = JointTrajectory()
+        msg.joint_names = self.joint_names
+
+        point = JointTrajectoryPoint()
+        point.positions = joint_angles
+        point.time_from_start.sec = int(duration)
+        point.time_from_start.nanosec = int((duration % 1.0) * 1e9)
+
+        msg.points.append(point)
+
+        self.joint_publisher.publish(msg)
+        self.get_logger().info(f"Sent joint trajectory: {joint_angles}")
+        time.sleep(2)
+
     
     
     ### WALL FOLLOWER HELPERS AND CODE
@@ -688,6 +789,27 @@ class ObjectCollector(Node):
                 self.publish_velocity(0,-c_x_obj/200)  
             else:
                 self.get_logger().info(f"DOESNT SEE obj")
+                
+        if  self.target_object is not None and self.robot_state == NAVIGATE_TO_OBJECT and self.detected_objects[self.target_object]['found']:
+            self.robot_state = ALIGN_WITH_OBJECT
+            self.publish_velocity(0.0,0.0)
+            # Gets the position of object in image
+            c_x_obj = self.detected_objects[self.target_object]['cx'] - self.image_width / 2 
+            self.get_logger().info(f"Aligning to tag {self.target_object}, angle distance from tag {c_x_obj}")
+            # If robot is aligned, switches to approaching state and updates arm position to be able to pick up obj
+            if abs(c_x_obj) < 6:
+                self.publish_velocity(0.0,0.0)
+                self.robot_state = MOVE_TO_SEEN
+                self.send_gripper_command(GRIPPER_OPEN)
+                self.publish_joint_angles(ARM_PICK_UP_JOINT)
+
+                return 
+            if self.detected_objects[self.target_object]['found']:
+                # Spins the robot slightly to center it
+                self.publish_velocity(0,-c_x_obj/200)  
+            else:
+                self.get_logger().info(f"DOESNT SEE obj")
+
 
             
 
