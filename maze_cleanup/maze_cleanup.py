@@ -311,7 +311,7 @@ class ObjectCollector(Node):
             localization_done = True
         else:
             self.counter += 1
-            self.publish_veglocity(.1,0) 
+            self.publish_velocity(.1,0) 
             localization_done = False
         if localization_done:
             self.robot_state = WALL_FOLLOW
