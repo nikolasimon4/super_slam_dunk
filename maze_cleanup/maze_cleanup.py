@@ -6,6 +6,7 @@ from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan, CompressedImage
 from geometry_msgs.msg import Point, Pose, PoseArray, PoseStamped, Quaternion
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
+from sensor_msgs.msg import Image
 
 import cv2
 import cv_bridge
@@ -14,7 +15,17 @@ import os
 import time
 import math
 import heapq
+import transforms3d.euler as euler
+import transforms3d.quaternions as quat
 
+
+
+# Helper functions
+def get_yaw_from_pose(p: Pose):
+    """A helper function that takes in a Pose object (geometry_msgs) and returns yaw."""
+    q = [p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z]
+    yaw = euler.quat2euler(q, axes="sxyz")[2]
+    return yaw
 
 # CONSTANTS
 INIT                           = "INIT"
@@ -32,6 +43,7 @@ NAVIGATE_TO_BIN                = "NAVIGATE_TO_BIN"
 DROP_OBJECT                    = "DROP_OBJECT"
 TASK_COMPLETE                  = "TASK_COMPLETE"
 
+OBJECTS = ["blue", "green", "pink"]
 
 class ObjectCollector(Node):
 
@@ -48,6 +60,7 @@ class ObjectCollector(Node):
         #Wall following
         self.desired_distance = .25 # Desired dist from wall when following
         self.recent_scan = None
+        self.counter = 0
         # State machine
         self.robot_state = INIT
         self.map_loaded = False
@@ -59,11 +72,31 @@ class ObjectCollector(Node):
         self.object_positions = {"blue": None, "green": None, "pink": None}
         self.objects_found    = {"blue": False, "green": False, "pink": False}
         
+        # Stores information on each detected object (found is false if obj isn't detected)
+        self.detected_objects = {
+            'pink': {'found': False, 'cx': 0, 'cy': 0, 'area': 0},
+            'green': {'found': False, 'cx': 0, 'cy': 0, 'area': 0},
+            'blue': {'found': False, 'cx': 0, 'cy': 0, 'area': 0}
+        }
+
+        # Same as above but for tags not in use
+        self.detected_tags = {
+            1: {'found': False, 'cx': 0, 'cy': 0, 'width': 0},
+            2: {'found': False, 'cx': 0, 'cy': 0, 'width': 0},
+            3: {'found': False, 'cx': 0, 'cy': 0, 'width': 0}
+        }
+
         # Runtime state variables
         self.target_object = None
         self.current_path = []
         self.has_object = False
-        self.robot_pose = None
+        self.robot_pose = Pose()
+        self.robot_pose.orientation.w = 0.0
+        self.robot_pose.orientation.x = 0.0
+        self.robot_pose.orientation.y = 0.0
+        self.robot_pose.orientation.z = 0.0
+        self.robot_pose.position.x = 0.0
+        self.robot_pose.position.y = 0.0
         self.safe_angle = -math.pi / 2
         self.closest_object_forward = None
         self.closest_object_left = None 
@@ -72,6 +105,15 @@ class ObjectCollector(Node):
             reliability=QoSReliabilityPolicy.RELIABLE,
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL
         )
+        
+        # Tunable constants for image and searching
+        self.image_width = 640 # changed later according to the actual received image
+        self.image_height = 480 
+        self.kp_angular = 1.0
+        self.kp_linear = 1.0
+        self.approach_area_threshold = 100 # colored objects
+        self.approach_width_threshold = 100 # AR tags
+        self.center_threshold = 50 # pixels
 
         # Subscribers
         self.create_subscription(
@@ -115,7 +157,7 @@ class ObjectCollector(Node):
         """
         Callback for pose subscription
         """ 
-        self.robot_pose = pose
+        self.robot_pose = pose.pose
     # Map loading
     def get_map_callback(self, msg: OccupancyGrid):
         """Receive a SLAM map from /map and store it."""
@@ -124,18 +166,42 @@ class ObjectCollector(Node):
             self.map_loaded = True
             self.get_logger().info("SLAM map received from /map.")
 
-    # Scan and image callbacks
+    # Scan callback
     def scan_callback(self, msg):
         self.closest_object_forward = self.find_closest_object_angle(msg,-math.pi/8,math.pi/8)
         self.closest_object_left = self.find_closest_object_angle(msg,-3 * math.pi / 4, -1 * math.pi/4)
         self.recent_scan = msg
         if(self.robot_state == LOCALIZE_WITH_FILTER or self.robot_state == WALL_FOLLOW):
             self.wall_follow_publish()
+        if(self.robot_state == OBSERVE_OBJECT and self.target_object and not self.detected_objects[self.target_object]['found']):
+            self.get_logger().info(f"GETTING OBJECT {self.target_object}")
+            f_width = math.pi/20 
+            
+            while(True):
+                ang, dist = self.find_closest_object_angle(msg,-f_width,f_width)
+                if(abs(abs(ang) - f_width) < f_width / 2):
+                    self.get_logger().info("Object detected, but currently detecting wall with lidar scan, decreasing forward looking distance")
+                    f_width = f_width / 2
+                else:
+                    if (dist>= 10):
+                        self.objects_found[self.target_object] = False
+                        self.target_object = None
+                        self.robot_state = WALL_FOLLOW
+                        self.get_logger().info("Object not aligned, continuing to look")
+                        return
+                    ob_pose = Pose()
+                    ob_pose.orientation = self.robot_pose.orientation
+                    ob_pose.position = self.robot_pose.position
+                    yaw = get_yaw_from_pose(self.robot_pose)
+                    ob_pose.position.x += math.cos(yaw) * dist
+                    ob_pose.position.y += math.sin(yaw) * dist
+                    self.object_positions[self.target_object] = ob_pose
+                    self.get_logger().info(f"GOT OBJECT {self.target_object} POSITION {ob_pose.position.x},{ob_pose.position.y} DISTANCE {dist}")
 
-    def image_callback(self, msg):
-        img = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        pass
-
+                    self.target_object = None
+                    self.robot_state = WALL_FOLLOW
+                    return
+                
     # State machine
     def state_machine_step(self):
 
@@ -198,12 +264,16 @@ class ObjectCollector(Node):
 
     def handle_particle_filter_localization(self):
         self.get_logger().info("Running particle filter localization...")
-        localization_done = False
+        if(self.counter > 5):
+            localization_done = True
+        else:
+            self.counter += 1
+            self.publish_velocity(.1,0) 
+            localization_done = False
         if localization_done:
             self.robot_state = WALL_FOLLOW
 
     def handle_wall_follow(self):
-        self.get_logger().info("Wall following...")
         # TODO: Wall follower implementation
         pass
 
@@ -535,16 +605,19 @@ class ObjectCollector(Node):
         if(self.closest_object_forward):
             lin = 0
             ang = 0
+            # If the wall is in front, turn until forward is clear
             if(self.closest_object_forward[1] < self.desired_distance + .05):
-                self.get_logger().error(f"PUBLISHING linear: {lin} ang {ang}, FORWARD")
                 ang = 1.5
                 lin = 0
             else:
+                # Set turning based on closest object on right side of robot
                 ang = (self.find_closest_object_angle(self.recent_scan, -math.pi/2 - math.pi /2 + math.pi/50, -math.pi/2 + math.pi/2 - math.pi/50)[0] - self.safe_angle) / 10 
+                # If the object is far away from a wall, turn until there is a wall nearby (eg 270 deg corner)
                 if((self.find_closest_object_angle(self.recent_scan, -math.pi/2 - math.pi /2, -math.pi/2 + math.pi/2)[1] - self.desired_distance) > .15):
                     lin = 0
                 else:
                     lin = .2
+                # If the distance error is too far, add to the angular movement
                 if (abs(self.find_closest_object_angle(self.recent_scan, -math.pi/2 - math.pi /2, -math.pi/2 + math.pi/2)[1] - self.desired_distance) > .05):
                     ang -= 10 * (self.find_closest_object_angle(self.recent_scan, -math.pi/2 - math.pi /2, -math.pi/2 + math.pi/2)[1] - self.desired_distance)
                     if((self.find_closest_object_angle(self.recent_scan, -math.pi/2 - math.pi /2, -math.pi/2 + math.pi/2)[1] - self.desired_distance) < 0):
@@ -559,6 +632,150 @@ class ObjectCollector(Node):
         if(self.robot_state == WALL_FOLLOW):
             pass
             
+
+    def image_callback(self, msg):
+        """
+        Deals with image every time one is recieved from camera
+        """
+
+        # converts the incoming ROS message to OpenCV format and HSV
+        image = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        self.image_height, self.image_width = image.shape[:2]
+        image = image[int(self.image_height * 0.75):self.image_height, 0:self.image_width]
+        self.image_height = self.image_height * .25
+        # detect colored tubes
+        self.detect_colored_tubes(image, hsv)
+        for color, info in self.detected_objects.items():
+            if info['found']:    
+                if not self.objects_found[color]:
+                    self.get_logger().info(f"color: {color}, cx: {info['cx']}, cy: {info['cy']}, area: {info['area']}")
+                    self.target_object = color
+                    self.objects_found[color] = True
+                    self.robot_state = OBSERVE_OBJECT
+                    self.publish_velocity(0,0)
+                    break
+                
+        # detect aruco tags (currently not in use)
+        # self.detect_aruco_tags(image, gray)
+
+        
+        # show debug image
+        debug_image = self.draw_debug_info(image)
+        cv2.imshow("debug_window", debug_image)
+        cv2.waitKey(1)
+        
+
+                
+        # If the robot is looking for an object and has found the object, aligns the robot
+        if  self.target_object is not None and self.robot_state == OBSERVE_OBJECT:
+            # Gets the position of object in image
+            c_x_obj = self.detected_objects[self.target_object]['cx'] - self.image_width / 2 
+            self.get_logger().info(f"Aligning to tag {self.target_object}, angle distance from tag {c_x_obj}")
+            # If robot is aligned, switches to approaching state and updates arm position to be able to pick up obj
+            if abs(c_x_obj) < 6:
+                self.publish_velocity(0.0,0.0)
+                self.detected_objects = {
+                    'pink': {'found': False, 'cx': 0, 'cy': 0, 'area': 0},
+                    'green': {'found': False, 'cx': 0, 'cy': 0, 'area': 0},
+                    'blue': {'found': False, 'cx': 0, 'cy': 0, 'area': 0}
+                }
+                return 
+            if self.detected_objects[self.target_object]['found']:
+                # Spins the robot slightly to center it
+                self.publish_velocity(0,-c_x_obj/200)  
+            else:
+                self.get_logger().info(f"DOESNT SEE obj")
+
+            
+
+    def detect_colored_tubes(self, image, hsv):
+
+        color_ranges = {'pink': (np.array([140, 50, 200]), np.array([160, 255, 255])),
+                        'green': (np.array([35, 100, 100]), np.array([45, 255, 255])),
+                        'blue': (np.array([90, 80, 80]), np.array([95, 210, 210]))}
+        
+        kernel = np.ones((5, 5), np.uint8)
+
+        for color, (lower, upper) in color_ranges.items():
+            mask = cv2.inRange(hsv, lower, upper)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+            M = cv2.moments(mask)
+
+            if M['m00'] > 5000:
+                cx = int(M['m10'] / M['m00'])
+                cy = int(M['m01'] / M['m00'])
+                area = M['m00']
+
+                self.detected_objects[color] = {
+                    'found': True,
+                    'cx': cx,
+                    'cy': cy,
+                    'area': area
+                }
+
+                cv2.circle(image, (cx, cy), 10, (0, 255, 0), -1)
+                cv2.putText(image, f'{color}: {area:.0f}', (cx, cy-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            else:
+                self.detected_objects[color]['found'] = False
+
+
+    def detect_aruco_tags(self, image, gray):
+        corners, ids, rejected = cv2.aruco.detectMarkers(gray, self.aruco_dict, parameters=self.aruco_parameters)
+
+        for tag_id in [1, 2, 3]:
+            self.detected_tags[tag_id]['found'] = False
+        
+        if ids is not None:
+            cv2.aruco.drawDetectedMarkers(image, corners, ids)
+
+            for i, tag_id in enumerate(ids.flatten()):
+                if tag_id in [1, 2, 3]:
+                    corner_points = corners[i][0]
+
+                    cx = int(np.mean(corner_points[:, 0]))
+                    cy = int(np.mean(corner_points[:, 1]))
+
+                    width = np.linalg.norm(corner_points[0] - corner_points[1])
+
+                    self.detected_tags[tag_id] = {
+                        'found': True,
+                        'cx': cx,
+                        'cy': cy,
+                        'width': width
+                    }
+
+                    if self.has_object and tag_id == self.target_tag and self.initial_tag_position is None:
+                        center_offset = cx - (self.image_width // 2)
+                        if center_offset < -20:
+                            self.initial_tag_position = 'left'
+                            self.get_logger().info(f'Tag {tag_id} initially detected on left')
+                        elif center_offset > 20:
+                            self.initial_tag_position = 'right'
+                            self.get_logger().info(f'Tag {tag_id} initially detected on right')
+                        else:
+                            self.initial_tag_position = 'center'
+                            self.get_logger().info(f'Tag {tag_id} initially detected on center')
+
+                    cv2.putText(image, f'Tag {tag_id}: {width:.0f}', (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+    
+    def draw_debug_info(self, image):
+        h, w = image.shape[:2]
+        cv2.line(image, (w//2, 0), (w//2, h), (255, 0, 0), 2)
+
+        cv2.putText(image, f'State: {self.robot_state}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(image, f'State: Arm_Obj: {self.has_object}', (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        if self.target_object:
+            cv2.putText(image, f'Target: {self.target_object} -> Tag None', (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        return image
+    
 
 def main(args=None):
     rclpy.init(args=args)
