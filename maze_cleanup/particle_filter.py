@@ -148,9 +148,9 @@ class ParticleFilter(Node):
         self.resample_yaw_noise = 0.04
 
         # Setup publishers and subscribers
-        self.particles_pub = self.create_publisher(PoseArray, "particle_cloud", 10)
+        self.particles_pub = self.create_publisher(PoseArray, f"/tb{ros_domain_id}/particle_cloud", 10)
         self.robot_estimate_pub = self.create_publisher(
-            PoseStamped, "estimated_robot_pose", 10
+            PoseStamped, f"/tb{ros_domain_id}/estimated_robot_pose", 10
         )
         qos_profile = QoSProfile(
             depth=1,
@@ -349,9 +349,10 @@ class ParticleFilter(Node):
 
         self.particle_cloud = new_particles
 
-    def robot_scan_received(self, data):
+    def robot_scan_received(self, data: LaserScan):
         # Wait until initialization is complete
         if not (self.initialized):
+            
             return
 
         # We need to be able to transfrom the laser frame to the base frame

@@ -4,6 +4,8 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan, CompressedImage
+from geometry_msgs.msg import Point, Pose, PoseArray, PoseStamped, Quaternion
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
 
 import cv2
 import cv_bridge
@@ -42,7 +44,10 @@ class ObjectCollector(Node):
         self.get_logger().info(f'ROS_DOMAIN_ID: {ros_domain_id}')
 
         self.bridge = cv_bridge.CvBridge()
-
+        
+        #Wall following
+        self.desired_distance = .25 # Desired dist from wall when following
+        self.recent_scan = None
         # State machine
         self.robot_state = INIT
         self.map_loaded = False
@@ -59,13 +64,21 @@ class ObjectCollector(Node):
         self.current_path = []
         self.has_object = False
         self.robot_pose = None
+        self.safe_angle = -math.pi / 2
+        self.closest_object_forward = None
+        self.closest_object_left = None 
+        qos_profile = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL
+        )
 
         # Subscribers
         self.create_subscription(
             OccupancyGrid,
             "/map",
             self.get_map_callback,
-            10
+            qos_profile
         )
         self.create_subscription(
             LaserScan,
@@ -77,6 +90,12 @@ class ObjectCollector(Node):
             CompressedImage,
             f"/tb{ros_domain_id}/oakd/rgb/preview/image_raw/compressed",
             self.image_callback,
+            10
+        )
+        self.create_subscription(
+            PoseStamped,
+            f"/tb{ros_domain_id}/estimated_robot_pose",
+            self.pose_callback,
             10
         )
 
@@ -92,6 +111,11 @@ class ObjectCollector(Node):
 
         self.get_logger().info("ObjectCollector Node Initialized")
 
+    def pose_callback(self, pose: PoseStamped):
+        """
+        Callback for pose subscription
+        """ 
+        self.robot_pose = pose
     # Map loading
     def get_map_callback(self, msg: OccupancyGrid):
         """Receive a SLAM map from /map and store it."""
@@ -102,7 +126,11 @@ class ObjectCollector(Node):
 
     # Scan and image callbacks
     def scan_callback(self, msg):
-        pass
+        self.closest_object_forward = self.find_closest_object_angle(msg,-math.pi/8,math.pi/8)
+        self.closest_object_left = self.find_closest_object_angle(msg,-3 * math.pi / 4, -1 * math.pi/4)
+        self.recent_scan = msg
+        if(self.robot_state == LOCALIZE_WITH_FILTER or self.robot_state == WALL_FOLLOW):
+            self.wall_follow_publish()
 
     def image_callback(self, msg):
         img = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -170,7 +198,6 @@ class ObjectCollector(Node):
 
     def handle_particle_filter_localization(self):
         self.get_logger().info("Running particle filter localization...")
-        # TODO: Integrate PF results
         localization_done = False
         if localization_done:
             self.robot_state = WALL_FOLLOW
@@ -451,6 +478,87 @@ class ObjectCollector(Node):
         path.append(cur)
         path.reverse()
         return path
+    
+    
+    
+    
+    
+    ### WALL FOLLOWER HELPERS AND CODE
+    
+    def find_closest_object_angle(self, scan: LaserScan, low: float, high: float) -> tuple[float, float]:
+        """
+        Finds closest object distance between low and high angles (with 0 being forward), given laser scan data 
+        """
+        ANG_ADJ = -math.pi/2
+        # List of distances
+        ranges = scan.ranges
+
+        # Min/max angle from scan
+        angle_min = scan.angle_min
+        angle_max = scan.angle_max
+        
+        # Min/max dist from scan
+        range_min = scan.range_min
+        range_max = scan.range_max
+
+        # Default values (not great edge case handling, but this would be a prob with sensor)
+        min_dist_angle = 0.0
+        min_dist = range_max
+
+        # Looping over each distance in the sensor
+        for index, dist in enumerate(ranges):
+            # Thrown out if the range is too large or small (eg invalid) (done according to laserscan documentation)
+            if dist > range_max or dist < range_min:
+                continue
+
+            # Adjust angle so it is from the point of reference of forward being 0
+            zeroed_angle = (angle_min + index * scan.angle_increment - ANG_ADJ)
+            
+            # If adjustment happens we loop back around so that the actual angle we output is within range [-pi,pi]
+            if min_dist_angle < angle_min:
+                min_dist_angle = angle_max - angle_min + min_dist_angle 
+            if min_dist_angle > angle_max:
+                min_dist_angle = angle_min - angle_max + min_dist_angle
+            
+            # Continuing if the scan is for a distance not in front 
+            if zeroed_angle > high or zeroed_angle < low:
+                continue 
+            # If this is a new closest object, set the min_distance to that and the angle to the current angle
+            if dist < min_dist:
+                min_dist = dist
+                min_dist_angle = zeroed_angle
+
+        
+        return (min_dist_angle, min_dist)
+    def wall_follow_publish(self):
+        
+        if(self.closest_object_forward):
+            lin = 0
+            ang = 0
+            if(self.closest_object_forward[1] < self.desired_distance + .05):
+                self.get_logger().error(f"PUBLISHING linear: {lin} ang {ang}, FORWARD")
+                ang = 1.5
+                lin = 0
+            else:
+                ang = (self.find_closest_object_angle(self.recent_scan, -math.pi/2 - math.pi /2 + math.pi/50, -math.pi/2 + math.pi/2 - math.pi/50)[0] - self.safe_angle) / 10 
+                if((self.find_closest_object_angle(self.recent_scan, -math.pi/2 - math.pi /2, -math.pi/2 + math.pi/2)[1] - self.desired_distance) > .15):
+                    lin = 0
+                else:
+                    lin = .2
+                if (abs(self.find_closest_object_angle(self.recent_scan, -math.pi/2 - math.pi /2, -math.pi/2 + math.pi/2)[1] - self.desired_distance) > .05):
+                    ang -= 10 * (self.find_closest_object_angle(self.recent_scan, -math.pi/2 - math.pi /2, -math.pi/2 + math.pi/2)[1] - self.desired_distance)
+                    if((self.find_closest_object_angle(self.recent_scan, -math.pi/2 - math.pi /2, -math.pi/2 + math.pi/2)[1] - self.desired_distance) < 0):
+                        ang -= .05
+                    else:
+                        ang += .05
+                
+            self.publish_velocity(lin,ang)
+        else:
+            self.get_logger().error("NO CLOSEST OBJECT FORWARD (still None)")
+                
+        if(self.robot_state == WALL_FOLLOW):
+            pass
+            
 
 def main(args=None):
     rclpy.init(args=args)
