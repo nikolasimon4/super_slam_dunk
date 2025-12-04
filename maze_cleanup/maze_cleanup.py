@@ -103,7 +103,16 @@ class ObjectCollector(Node):
         # Object tracking
         self.object_positions = {"blue": None, "green": None, "pink": None}
         self.objects_found    = {"blue": False, "green": False, "pink": False}
-        
+        # TO TEST A* CODE:
+        """
+        SET pink to true in objects_found
+        Create Pose() object for pink with desired x and y coordinates and put it into self.objects_found
+        Create Pose() object for robot and set self.robot_pose to the desired starting point (should be somewhere you can put the robot relatively confidently in it's pose)
+        In handle_load_slam map, instead of the localize_with_filter phase, set the robot state to WAIT_FOR_TARGET state
+        At this point the robot will set the object to pink (handle_wait_for_target()) and then go to the plan_path state
+        This should then just run as if the robot has the object and pose correct. after it moves a bit the pose should update to something more useful and you should be able to rerun the a* code
+        That said it is fine if the robot moves really slowly during A* to minimize error 
+        """
         # Stores information on each detected object (found is false if obj isn't detected)
         self.detected_objects = {
             'pink': {'found': False, 'cx': 0, 'cy': 0, 'area': 0},
@@ -208,8 +217,7 @@ class ObjectCollector(Node):
         
         if(self.robot_state == LOCALIZE_WITH_FILTER or self.robot_state == WALL_FOLLOW):
             if(self.objects_count == 3 and self.countdown <= 0):
-                self.robot_state = PLAN_PATH_TO_OBJECT
-                self.target_object = "pink"
+                self.robot_state = WAIT_FOR_TARGET
                 return 
             self.wall_follow_publish()
         if(self.robot_state == OBSERVE_OBJECT and self.target_object and not self.detected_objects[self.target_object]['found']):
@@ -326,6 +334,7 @@ class ObjectCollector(Node):
         pass
 
     def handle_wait_for_target(self):
+        self.target_object = "pink"
         if self.target_object is not None:
             self.robot_state = PLAN_PATH_TO_OBJECT
 
