@@ -111,7 +111,7 @@ class ObjectCollector(Node):
         In handle_load_slam map, instead of the localize_with_filter phase, set the robot state to WAIT_FOR_TARGET state
         At this point the robot will set the object to pink (handle_wait_for_target()) and then go to the plan_path state
         This should then just run as if the robot has the object and pose correct. after it moves a bit the pose should update to something more useful and you should be able to rerun the a* code
-        That said it is fine if the robot moves really slowly during A* to minimize error 
+        That said it is fine if the robot moves really slowly during A* to minimize error_ 
         """
         # Stores information on each detected object (found is false if obj isn't detected)
         self.detected_objects = {
@@ -754,8 +754,8 @@ class ObjectCollector(Node):
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         self.image_height, self.image_width = image.shape[:2]
-        image = image[int(self.image_height * 0.75):self.image_height, 0:self.image_width]
-        self.image_height = self.image_height * .25
+        image = image[int(self.image_height * 0.5):self.image_height, 0:self.image_width]
+        self.image_height = self.image_height * .5
         # detect colored tubes
         self.detect_colored_tubes(image, hsv)
         for color, info in self.detected_objects.items():
@@ -798,6 +798,9 @@ class ObjectCollector(Node):
                 self.publish_velocity(0,-c_x_obj/200)  
             else:
                 self.get_logger().info(f"DOESNT SEE obj")
+                self.objects_found[self.target_object] = False
+                self.target_object = None
+                self.robot_state = WALL_FOLLOW
                 
         if  self.target_object is not None and self.robot_state == NAVIGATE_TO_OBJECT and self.detected_objects[self.target_object]['found']:
             self.robot_state = ALIGN_WITH_OBJECT
@@ -825,8 +828,8 @@ class ObjectCollector(Node):
     def detect_colored_tubes(self, image, hsv):
 
         color_ranges = {'pink': (np.array([140, 50, 200]), np.array([160, 255, 255])),
-                        'green': (np.array([35, 100, 100]), np.array([45, 255, 255])),
-                        'blue': (np.array([90, 80, 80]), np.array([95, 210, 210]))}
+                        'green': (np.array([35, 100, 100]), np.array([40, 255, 255])),
+                        'blue': (np.array([90, 80, 80]), np.array([93, 210, 210]))}
         
         kernel = np.ones((5, 5), np.uint8)
 
