@@ -354,11 +354,10 @@ class ParticleFilter(Node):
         if not (self.initialized):
             
             return
-
+        self.get_logger().info("RECIEVED SCAN IN PARTICLE FILTER")
         # We need to be able to transfrom the laser frame to the base frame
-        if not self.tf_buffer.can_transform(
-            self.base_frame, data.header.frame_id, data.header.stamp
-        ):
+        if not self.tf_buffer.can_transform(self.base_frame, data.header.frame_id, data.header.stamp):
+            self.get_logger().error("CANT TRANSFORM???")
             return
 
         # Wait for a little bit for the transform to become avaliable (in case the scan arrives

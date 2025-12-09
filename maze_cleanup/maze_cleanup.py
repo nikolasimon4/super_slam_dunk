@@ -8,6 +8,7 @@ from geometry_msgs.msg import Point, Pose, PoseArray, PoseStamped, Quaternion, P
 from visualization_msgs.msg import Marker
 from std_msgs.msg import ColorRGBA
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
+from sensor_msgs.msg import Image
 
 import cv2
 import cv_bridge
@@ -16,7 +17,43 @@ import os
 import time
 import math
 import heapq
+import transforms3d.euler as euler
+import transforms3d.quaternions as quat
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
+from omx_cpp_interface.msg import ArmGripperPosition
+from control_msgs.action import GripperCommand
+from rclpy.action import ActionClient
+
+
+# Helper functions
+def get_yaw_from_pose(p: Pose):
+    """A helper function that takes in a Pose object (geometry_msgs) and returns yaw."""
+    q = [p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z]
+    yaw = euler.quat2euler(q, axes="sxyz")[2]
+    return yaw
+
+# Picking up joint positions
+PICK_JOINT1 = 0.0
+PICK_JOINT2 = 0.5
+PICK_JOINT3 = -0.350
+PICK_JOINT4 =  0.0
+
+
+# Stowed joint positions
+STOW_JOINT1 = 0.0
+STOW_JOINT2 = -0.7
+STOW_JOINT3 = -0.350
+STOW_JOINT4 =  0.0
+
+
+# Values for opening/closing the gripper
+GRIPPER_OPEN = .009
+GRIPPER_CLOSED = -.009
+
+# Arrays to pass into function to make pos passing easier
+ARM_PICK_UP_JOINT = [PICK_JOINT1, PICK_JOINT2, PICK_JOINT3, PICK_JOINT4]
+ARM_STOW_JOINT = [STOW_JOINT1, STOW_JOINT2, STOW_JOINT3, STOW_JOINT4]
 
 # CONSTANTS
 INIT                           = "INIT"
@@ -27,6 +64,7 @@ OBSERVE_OBJECT                 = "OBSERVE_OBJECT"
 WAIT_FOR_TARGET                = "WAIT_FOR_TARGET"
 PLAN_PATH_TO_OBJECT            = "PLAN_PATH_TO_OBJECT"
 NAVIGATE_TO_OBJECT             = "NAVIGATE_TO_OBJECT"
+MOVE_TO_SEEN                   = "MOVE_TO_SEEN"
 ALIGN_WITH_OBJECT              = "ALIGN_WITH_OBJECT"
 PICK_UP_OBJECT                 = "PICK_UP_OBJECT"
 PLAN_PATH_TO_BIN               = "PLAN_PATH_TO_BIN"
@@ -40,9 +78,10 @@ TEST_PROMPT_TARGET             = "TEST_PROMPT_TARGET"
 TEST_PLAN_AND_LOG              = "TEST_PLAN_AND_LOG"
 FOLLOW_PATH                    = "FOLLOW_PATH"
 
-# Whenn true, skips wall following, prompts for target)
+# When true, skips wall following, prompts for target
 TEST_MODE = True
 
+OBJECTS = ["blue", "green", "pink"]
 
 class ObjectCollector(Node):
 
@@ -59,21 +98,54 @@ class ObjectCollector(Node):
         #Wall following
         self.desired_distance = .25
         self.recent_scan = None
+        self.counter = 0
+        self.countdown = 1000
         # State machine
+        self.objects_count = 0
         self.robot_state = INIT
         self.map_loaded = False
         self.map = None
         self.obstacle_map = None
+        self.desired_distance_color = .35
 
         # Object tracking
         self.object_positions = {"blue": None, "green": None, "pink": None}
         self.objects_found    = {"blue": False, "green": False, "pink": False}
-        
+        # TO TEST A* CODE:
+        """
+        SET pink to true in objects_found
+        Create Pose() object for pink with desired x and y coordinates and put it into self.objects_found
+        Create Pose() object for robot and set self.robot_pose to the desired starting point (should be somewhere you can put the robot relatively confidently in it's pose)
+        In handle_load_slam map, instead of the localize_with_filter phase, set the robot state to WAIT_FOR_TARGET state
+        At this point the robot will set the object to pink (handle_wait_for_target()) and then go to the plan_path state
+        This should then just run as if the robot has the object and pose correct. after it moves a bit the pose should update to something more useful and you should be able to rerun the a* code
+        That said it is fine if the robot moves really slowly during A* to minimize error_ 
+        """
+        # Stores information on each detected object (found is false if obj isn't detected)
+        self.detected_objects = {
+            'pink': {'found': False, 'cx': 0, 'cy': 0, 'area': 0},
+            'green': {'found': False, 'cx': 0, 'cy': 0, 'area': 0},
+            'blue': {'found': False, 'cx': 0, 'cy': 0, 'area': 0}
+        }
+
+        # Same as above but for tags not in use
+        self.detected_tags = {
+            1: {'found': False, 'cx': 0, 'cy': 0, 'width': 0},
+            2: {'found': False, 'cx': 0, 'cy': 0, 'width': 0},
+            3: {'found': False, 'cx': 0, 'cy': 0, 'width': 0}
+        }
+
         # Runtime state variables
         self.target_object = None
         self.current_path = []
         self.has_object = False
-        self.robot_pose = None
+        self.robot_pose = Pose()
+        self.robot_pose.orientation.w = 0.0
+        self.robot_pose.orientation.x = 0.0
+        self.robot_pose.orientation.y = 0.0
+        self.robot_pose.orientation.z = 0.0
+        self.robot_pose.position.x = 0.0
+        self.robot_pose.position.y = 0.0
         self.safe_angle = -math.pi / 2
         self.closest_object_forward = None
         self.closest_object_left = None
@@ -95,6 +167,15 @@ class ObjectCollector(Node):
             reliability=QoSReliabilityPolicy.RELIABLE,
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL
         )
+        
+        # Tunable constants for image and searching
+        self.image_width = 640 # changed later according to the actual received image
+        self.image_height = 480 
+        self.kp_angular = 1.0
+        self.kp_linear = 1.0
+        self.approach_area_threshold = 100 # colored objects
+        self.approach_width_threshold = 100 # AR tags
+        self.center_threshold = 50 # pixels
 
         # Subscribers
         self.create_subscription(
@@ -225,7 +306,6 @@ class ObjectCollector(Node):
         self.publish_path_visualization(path)
         
         self.robot_state = FOLLOW_PATH
-
     # Map loading
     def get_map_callback(self, msg: OccupancyGrid):
         """Receive a SLAM map from /map and store it."""
@@ -234,19 +314,50 @@ class ObjectCollector(Node):
             self.map_loaded = True
             self.get_logger().info("SLAM map received from /map.")
 
-    # Scan and image callbacks
+    # Scan callback
     def scan_callback(self, msg):
         self.closest_object_forward = self.find_closest_object_angle(msg,-math.pi/8,math.pi/8)
         self.closest_object_left = self.find_closest_object_angle(msg,-3 * math.pi / 4, -1 * math.pi/4)
         self.recent_scan = msg
         # Only run wall follow in those specific states (not during path following)
         if self.robot_state == LOCALIZE_WITH_FILTER or self.robot_state == WALL_FOLLOW:
+            if self.objects_count == 3 and self.countdown <= 0:
+                self.robot_state = WAIT_FOR_TARGET
+                return
             self.wall_follow_publish()
+        if(self.robot_state == OBSERVE_OBJECT and self.target_object and not self.detected_objects[self.target_object]['found']):
+            self.get_logger().info(f"GETTING OBJECT {self.target_object}")
+            f_width = math.pi/20 
+            
+            while(True):
+                ang, dist = self.find_closest_object_angle(msg,-f_width,f_width)
+                if(abs(abs(ang) - f_width) < f_width / 2):
+                    self.get_logger().info("Object detected, but currently detecting wall with lidar scan, decreasing forward looking distance")
+                    f_width = f_width / 2
+                else:
+                    if (dist>= 10):
+                        self.objects_found[self.target_object] = False
+                        self.target_object = None
+                        self.robot_state = WALL_FOLLOW
+                        self.get_logger().info("Object not aligned, continuing to look")
+                        return
+                    ob_pose = Pose()
+                    ob_pose.orientation = self.robot_pose.orientation
+                    ob_pose.position = self.robot_pose.position
+                    self.object_positions[self.target_object] = ob_pose
+                    self.get_logger().info(f"GOT OBJECT {self.target_object} POSITION {ob_pose.position.x},{ob_pose.position.y} DISTANCE {dist}")
+                    self.objects_count += 1
+                    self.target_object = None
+                    self.robot_state = WALL_FOLLOW
+                    return
+        forward_obj_ang, forward_obj_dist = self.find_closest_object_angle(msg,-math.pi/20,math.pi/20)
 
-    def image_callback(self, msg):
-        img = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        pass
-
+        # If the robot is approaching and within the desired distance stops the robot and updates the state
+        if (self.robot_state == MOVE_TO_SEEN and forward_obj_dist < self.desired_distance_color):
+            
+            self.robot_state = PICK_UP_OBJECT
+            self.publish_velocity(0.0,0.0)
+            return         
     # State machine
     def state_machine_step(self):
 
@@ -322,13 +433,18 @@ class ObjectCollector(Node):
 
     def handle_particle_filter_localization(self):
         self.get_logger().info("Running particle filter localization...")
-        localization_done = False
+        if(self.counter > 5):
+            localization_done = True
+        else:
+            self.counter += 1
+            self.publish_velocity(.1,0) 
+            localization_done = False
         if localization_done:
             self.robot_state = WALL_FOLLOW
 
     def handle_wall_follow(self):
-        self.get_logger().info("Wall following...")
-        # TODO: Wall follower implementation
+        if(self.objects_count == 3):
+            self.countdown -= 1
         pass
 
     def handle_observe_object(self):
@@ -336,6 +452,7 @@ class ObjectCollector(Node):
         pass
 
     def handle_wait_for_target(self):
+        self.target_object = "pink"
         if self.target_object is not None:
             self.robot_state = PLAN_PATH_TO_OBJECT
 
@@ -360,9 +477,19 @@ class ObjectCollector(Node):
             # TODO: handle failure (eg go back to exploration)
 
     def handle_navigate_to_object(self):
-        arrived = False
-        if arrived:
-            self.robot_state = ALIGN_WITH_OBJECT
+        pass
+    def handle_move_to_seen_object(self):
+        # Finds position of object/tag relative to robot in image
+        if self.target_object is not None and self.detected_objects[self.target_object]['found']:
+            cx = self.detected_objects[self.target_object]['cx'] - self.image_width / 2
+        else:
+            cx = 0
+            self.get_logger().info(f"Object/tag not found, target obj {self.target_object}, target tag: {self.target_tag}")
+        # Moves robot forward
+        self.publish_velocity(.1 , 0)
+        time.sleep(.1)
+        # Attempts to move slowly to keep robot aligned to object
+        self.publish_velocity(0, -(cx / 50))
 
     def handle_align_with_object(self):
         refined = True
@@ -370,6 +497,10 @@ class ObjectCollector(Node):
             self.robot_state = PICK_UP_OBJECT
 
     def handle_pick_up_object(self):
+        # Closes gripper
+        self.send_gripper_command(GRIPPER_CLOSED)
+        # Stows gripper
+        self.publish_joint_angles(ARM_STOW_JOINT)
         self.has_object = True
         self.robot_state = PLAN_PATH_TO_BIN
 
@@ -975,6 +1106,50 @@ class ObjectCollector(Node):
         
         idx = self.grid_to_index(grid[0], grid[1])
         return self.obstacle_map[idx] != 100
+
+    ### GRIPPER HELPERS
+    def send_gripper_command(self, position, effort=1.0):
+        """
+        sends command to gripper to move to given position with given effort
+
+        Args:
+            position (int): Position of gripper (see constants above)
+            effort (float, optional): Torque value, default 1 is fine. Defaults to 1.0.
+        """
+        goal = GripperCommand.Goal()
+        goal.command.position = position 
+        goal.command.max_effort = effort 
+        self.get_logger().info(f'Sending gripper command: position={position}')
+        self.gripper_pub.send_goal_async(goal)
+        time.sleep(2)        
+
+    def publish_joint_angles(self, joint_angles, duration=1.0):
+        """Publishes given joint angles to arm
+
+        Args:
+            joint_angles (list of joint angles): list of joint angles to be published in order (j1,j2...)
+            duration (float, optional): Duration of movement, default is good enough. Defaults to 1.0.
+        """
+        
+        # If the joint angle input doesn't match to expected names, prints an error
+        if len(joint_angles) != len(self.joint_names):
+            self.get_logger().error(f"Expected {len(self.joint_names)} joint angles, got {len(joint_angles)}")
+            return
+
+        # Constructing joint_trajectory message
+        msg = JointTrajectory()
+        msg.joint_names = self.joint_names
+
+        point = JointTrajectoryPoint()
+        point.positions = joint_angles
+        point.time_from_start.sec = int(duration)
+        point.time_from_start.nanosec = int((duration % 1.0) * 1e9)
+
+        msg.points.append(point)
+
+        self.joint_publisher.publish(msg)
+        self.get_logger().info(f"Sent joint trajectory: {joint_angles}")
+        time.sleep(2)
     
     ### WALL FOLLOWER HELPERS AND CODE
     def find_closest_object_angle(self, scan: LaserScan, low: float, high: float) -> tuple[float, float]:
@@ -1028,16 +1203,19 @@ class ObjectCollector(Node):
         if(self.closest_object_forward):
             lin = 0
             ang = 0
+            # If the wall is in front, turn until forward is clear
             if(self.closest_object_forward[1] < self.desired_distance + .05):
-                self.get_logger().error(f"PUBLISHING linear: {lin} ang {ang}, FORWARD")
                 ang = 1.5
                 lin = 0
             else:
+                # Set turning based on closest object on right side of robot
                 ang = (self.find_closest_object_angle(self.recent_scan, -math.pi/2 - math.pi /2 + math.pi/50, -math.pi/2 + math.pi/2 - math.pi/50)[0] - self.safe_angle) / 10 
+                # If the object is far away from a wall, turn until there is a wall nearby (eg 270 deg corner)
                 if((self.find_closest_object_angle(self.recent_scan, -math.pi/2 - math.pi /2, -math.pi/2 + math.pi/2)[1] - self.desired_distance) > .15):
                     lin = 0
                 else:
                     lin = .2
+                # If the distance error is too far, add to the angular movement
                 if (abs(self.find_closest_object_angle(self.recent_scan, -math.pi/2 - math.pi /2, -math.pi/2 + math.pi/2)[1] - self.desired_distance) > .05):
                     ang -= 10 * (self.find_closest_object_angle(self.recent_scan, -math.pi/2 - math.pi /2, -math.pi/2 + math.pi/2)[1] - self.desired_distance)
                     if((self.find_closest_object_angle(self.recent_scan, -math.pi/2 - math.pi /2, -math.pi/2 + math.pi/2)[1] - self.desired_distance) < 0):
@@ -1052,6 +1230,174 @@ class ObjectCollector(Node):
         if(self.robot_state == WALL_FOLLOW):
             pass
 
+
+    def image_callback(self, msg):
+        """
+        Deals with image every time one is recieved from camera
+        """
+
+        # converts the incoming ROS message to OpenCV format and HSV
+        image = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        self.image_height, self.image_width = image.shape[:2]
+        image = image[int(self.image_height * 0.5):self.image_height, 0:self.image_width]
+        self.image_height = self.image_height * .5
+        # detect colored tubes
+        self.detect_colored_tubes(image, hsv)
+        for color, info in self.detected_objects.items():
+            if info['found']:    
+                if not self.objects_found[color]:
+                    self.get_logger().info(f"color: {color}, cx: {info['cx']}, cy: {info['cy']}, area: {info['area']}")
+                    self.target_object = color
+                    self.objects_found[color] = True
+                    self.robot_state = OBSERVE_OBJECT
+                    self.publish_velocity(0,0)
+                    break
+                
+        # detect aruco tags (currently not in use)
+        # self.detect_aruco_tags(image, gray)
+
+        
+        # show debug image
+        debug_image = self.draw_debug_info(image)
+        cv2.imshow("debug_window", debug_image)
+        cv2.waitKey(1)
+        
+
+                
+        # If the robot is looking for an object and has found the object, aligns the robot
+        if  self.target_object is not None and self.robot_state == OBSERVE_OBJECT:
+            # Gets the position of object in image
+            c_x_obj = self.detected_objects[self.target_object]['cx'] - self.image_width / 2 
+            self.get_logger().info(f"Aligning to tag {self.target_object}, angle distance from tag {c_x_obj}")
+            # If robot is aligned, switches to approaching state and updates arm position to be able to pick up obj
+            if abs(c_x_obj) < 6:
+                self.publish_velocity(0.0,0.0)
+                self.detected_objects = {
+                    'pink': {'found': False, 'cx': 0, 'cy': 0, 'area': 0},
+                    'green': {'found': False, 'cx': 0, 'cy': 0, 'area': 0},
+                    'blue': {'found': False, 'cx': 0, 'cy': 0, 'area': 0}
+                }
+                return 
+            if self.detected_objects[self.target_object]['found']:
+                # Spins the robot slightly to center it
+                self.publish_velocity(0,-c_x_obj/200)  
+            else:
+                self.get_logger().info(f"DOESNT SEE obj")
+                self.objects_found[self.target_object] = False
+                self.target_object = None
+                self.robot_state = WALL_FOLLOW
+                
+        if  self.target_object is not None and self.robot_state == NAVIGATE_TO_OBJECT and self.detected_objects[self.target_object]['found']:
+            self.robot_state = ALIGN_WITH_OBJECT
+            self.publish_velocity(0.0,0.0)
+            # Gets the position of object in image
+            c_x_obj = self.detected_objects[self.target_object]['cx'] - self.image_width / 2 
+            self.get_logger().info(f"Aligning to tag {self.target_object}, angle distance from tag {c_x_obj}")
+            # If robot is aligned, switches to approaching state and updates arm position to be able to pick up obj
+            if abs(c_x_obj) < 6:
+                self.publish_velocity(0.0,0.0)
+                self.robot_state = MOVE_TO_SEEN
+                self.send_gripper_command(GRIPPER_OPEN)
+                self.publish_joint_angles(ARM_PICK_UP_JOINT)
+
+                return 
+            if self.detected_objects[self.target_object]['found']:
+                # Spins the robot slightly to center it
+                self.publish_velocity(0,-c_x_obj/200)  
+            else:
+                self.get_logger().info(f"DOESNT SEE obj")
+
+
+            
+
+    def detect_colored_tubes(self, image, hsv):
+
+        color_ranges = {'pink': (np.array([140, 50, 200]), np.array([160, 255, 255])),
+                        'green': (np.array([35, 100, 100]), np.array([40, 255, 255])),
+                        'blue': (np.array([90, 80, 80]), np.array([93, 210, 210]))}
+        
+        kernel = np.ones((5, 5), np.uint8)
+
+        for color, (lower, upper) in color_ranges.items():
+            mask = cv2.inRange(hsv, lower, upper)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+            M = cv2.moments(mask)
+
+            if M['m00'] > 5000:
+                cx = int(M['m10'] / M['m00'])
+                cy = int(M['m01'] / M['m00'])
+                area = M['m00']
+
+                self.detected_objects[color] = {
+                    'found': True,
+                    'cx': cx,
+                    'cy': cy,
+                    'area': area
+                }
+
+                cv2.circle(image, (cx, cy), 10, (0, 255, 0), -1)
+                cv2.putText(image, f'{color}: {area:.0f}', (cx, cy-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            else:
+                self.detected_objects[color]['found'] = False
+
+
+    def detect_aruco_tags(self, image, gray):
+        corners, ids, rejected = cv2.aruco.detectMarkers(gray, self.aruco_dict, parameters=self.aruco_parameters)
+
+        for tag_id in [1, 2, 3]:
+            self.detected_tags[tag_id]['found'] = False
+        
+        if ids is not None:
+            cv2.aruco.drawDetectedMarkers(image, corners, ids)
+
+            for i, tag_id in enumerate(ids.flatten()):
+                if tag_id in [1, 2, 3]:
+                    corner_points = corners[i][0]
+
+                    cx = int(np.mean(corner_points[:, 0]))
+                    cy = int(np.mean(corner_points[:, 1]))
+
+                    width = np.linalg.norm(corner_points[0] - corner_points[1])
+
+                    self.detected_tags[tag_id] = {
+                        'found': True,
+                        'cx': cx,
+                        'cy': cy,
+                        'width': width
+                    }
+
+                    if self.has_object and tag_id == self.target_tag and self.initial_tag_position is None:
+                        center_offset = cx - (self.image_width // 2)
+                        if center_offset < -20:
+                            self.initial_tag_position = 'left'
+                            self.get_logger().info(f'Tag {tag_id} initially detected on left')
+                        elif center_offset > 20:
+                            self.initial_tag_position = 'right'
+                            self.get_logger().info(f'Tag {tag_id} initially detected on right')
+                        else:
+                            self.initial_tag_position = 'center'
+                            self.get_logger().info(f'Tag {tag_id} initially detected on center')
+
+                    cv2.putText(image, f'Tag {tag_id}: {width:.0f}', (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+    
+    def draw_debug_info(self, image):
+        h, w = image.shape[:2]
+        cv2.line(image, (w//2, 0), (w//2, h), (255, 0, 0), 2)
+
+        cv2.putText(image, f'State: {self.robot_state}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(image, f'State: Arm_Obj: {self.has_object}', (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        if self.target_object:
+            cv2.putText(image, f'Target: {self.target_object} -> Tag None', (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        return image
+    
 
 def main(args=None):
     rclpy.init(args=args)
