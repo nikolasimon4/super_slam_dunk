@@ -2,9 +2,11 @@ import rclpy
 from rclpy.node import Node
 
 from geometry_msgs.msg import Twist
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Path
 from sensor_msgs.msg import LaserScan, CompressedImage
-from geometry_msgs.msg import Point, Pose, PoseArray, PoseStamped, Quaternion
+from geometry_msgs.msg import Point, Pose, PoseArray, PoseStamped, Quaternion, PointStamped
+from visualization_msgs.msg import Marker
+from std_msgs.msg import ColorRGBA
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
 
 import cv2
@@ -32,6 +34,15 @@ NAVIGATE_TO_BIN                = "NAVIGATE_TO_BIN"
 DROP_OBJECT                    = "DROP_OBJECT"
 TASK_COMPLETE                  = "TASK_COMPLETE"
 
+# Test states
+TEST_WAIT_FOR_READY            = "TEST_WAIT_FOR_READY"
+TEST_PROMPT_TARGET             = "TEST_PROMPT_TARGET"
+TEST_PLAN_AND_LOG              = "TEST_PLAN_AND_LOG"
+FOLLOW_PATH                    = "FOLLOW_PATH"
+
+# Whenn true, skips wall following, prompts for target)
+TEST_MODE = True
+
 
 class ObjectCollector(Node):
 
@@ -46,14 +57,13 @@ class ObjectCollector(Node):
         self.bridge = cv_bridge.CvBridge()
         
         #Wall following
-        self.desired_distance = .25 # Desired dist from wall when following
+        self.desired_distance = .25
         self.recent_scan = None
         # State machine
         self.robot_state = INIT
         self.map_loaded = False
         self.map = None
-        self.inflated_map = None # Map that has inflated walls to improve A* pathing
-        self.inflation_radius = 0.2 # Tunable for how much inflation we want  
+        self.obstacle_map = None
 
         # Object tracking
         self.object_positions = {"blue": None, "green": None, "pink": None}
@@ -66,7 +76,20 @@ class ObjectCollector(Node):
         self.robot_pose = None
         self.safe_angle = -math.pi / 2
         self.closest_object_forward = None
-        self.closest_object_left = None 
+        self.closest_object_left = None
+        
+        # Test mode flag
+        self.test_prompted = False
+        self.clicked_goal = None
+        
+        # Path following parameters
+        self.path_index = 0                    # Current waypoint index
+        self.waypoint_tolerance = 0.20         # How close to waypoint before moving to next (meters)
+        self.goal_tolerance = 0.15             # How close to final goal (meters)
+        self.linear_speed = 0.12               # Forward speed
+        self.angular_speed = 0.4               # Max turning speed
+        self.angle_tolerance = 0.4             # Angle error before moving forward (radians)
+        
         qos_profile = QoSProfile(
             depth=1,
             reliability=QoSReliabilityPolicy.RELIABLE,
@@ -98,6 +121,14 @@ class ObjectCollector(Node):
             self.pose_callback,
             10
         )
+        
+        # Subscribe to RViz clicked point for testing A* paths
+        self.create_subscription(
+            PointStamped,
+            "/clicked_point",
+            self.clicked_point_callback,
+            10
+        )
 
         # Publisher
         self.cmd_pub = self.create_publisher(
@@ -105,6 +136,11 @@ class ObjectCollector(Node):
             f"/tb{ros_domain_id}/cmd_vel",
             10
         )
+        
+        # Visualization publishers
+        self.goal_marker_pub = self.create_publisher(Marker, "/goal_marker", 10)
+        self.path_marker_pub = self.create_publisher(Marker, "/planned_path", 10)
+        self.path_pub = self.create_publisher(Path, "/astar_path", 10)
 
         # State machine timer 
         self.create_timer(0.1, self.state_machine_step)
@@ -116,6 +152,80 @@ class ObjectCollector(Node):
         Callback for pose subscription
         """ 
         self.robot_pose = pose
+
+    def clicked_point_callback(self, msg: PointStamped):
+        """
+        Callback for RViz 'Publish Point' tool clicks.
+        Click anywhere on the map to test A* path planning.
+        """
+        goal_x = msg.point.x
+        goal_y = msg.point.y
+        
+        self.get_logger().info("=" * 60)
+        self.get_logger().info("CLICKED POINT RECEIVED")
+        self.get_logger().info(f"Goal: ({goal_x:.3f}, {goal_y:.3f})")
+        
+        # Check if map is loaded
+        if not self.map_loaded:
+            self.get_logger().error("No map loaded yet!")
+            return
+        
+        # Require robot pose for path planning
+        if self.robot_pose is None:
+            self.get_logger().error("No robot pose yet! Make sure particle filter is running.")
+            self.get_logger().info("=" * 60)
+            return
+        
+        start_x = self.robot_pose.pose.position.x
+        start_y = self.robot_pose.pose.position.y
+        
+        self.get_logger().info(f"Start: ({start_x:.3f}, {start_y:.3f})")
+        
+        # Check if goal is valid
+        if not self.is_valid_goal(goal_x, goal_y):
+            self.get_logger().warn("Goal is in obstacle or out of bounds!")
+        
+        # Plan path
+        path = self.plan_path((start_x, start_y), (goal_x, goal_y))
+        
+        if not path:
+            self.get_logger().error("NO PATH FOUND!")
+            self.get_logger().info("=" * 60)
+            return
+        
+        # Log waypoints (sample if too many)
+        self.get_logger().info(f"PATH FOUND: {len(path)} waypoints")
+        self.get_logger().info("-" * 40)
+        
+        # Show first 5, last 5, and every 10th in between
+        for i, (x, y) in enumerate(path):
+            if i < 5 or i >= len(path) - 5 or i % 10 == 0:
+                self.get_logger().info(f"  [{i:3d}] ({x:7.3f}, {y:7.3f})")
+            elif i == 5:
+                self.get_logger().info(f"  ... ({len(path) - 10} more waypoints) ...")
+        
+        # Calculate total distance
+        total_dist = sum(
+            math.sqrt((path[i][0] - path[i-1][0])**2 + (path[i][1] - path[i-1][1])**2)
+            for i in range(1, len(path))
+        )
+        
+        self.get_logger().info("-" * 40)
+        self.get_logger().info(f"Total distance: {total_dist:.2f} meters")
+        self.get_logger().info("STARTING PATH FOLLOWING...")
+        self.get_logger().info("=" * 60)
+        
+        # Store path and start following
+        self.clicked_goal = (goal_x, goal_y)
+        self.current_path = path
+        self.path_index = 0
+        
+        # Publish visualization to RViz
+        self.publish_goal_marker(goal_x, goal_y)
+        self.publish_path_visualization(path)
+        
+        self.robot_state = FOLLOW_PATH
+
     # Map loading
     def get_map_callback(self, msg: OccupancyGrid):
         """Receive a SLAM map from /map and store it."""
@@ -129,7 +239,8 @@ class ObjectCollector(Node):
         self.closest_object_forward = self.find_closest_object_angle(msg,-math.pi/8,math.pi/8)
         self.closest_object_left = self.find_closest_object_angle(msg,-3 * math.pi / 4, -1 * math.pi/4)
         self.recent_scan = msg
-        if(self.robot_state == LOCALIZE_WITH_FILTER or self.robot_state == WALL_FOLLOW):
+        # Only run wall follow in those specific states (not during path following)
+        if self.robot_state == LOCALIZE_WITH_FILTER or self.robot_state == WALL_FOLLOW:
             self.wall_follow_publish()
 
     def image_callback(self, msg):
@@ -181,6 +292,13 @@ class ObjectCollector(Node):
         elif self.robot_state == TASK_COMPLETE:
             self.handle_task_complete()
 
+        # Test states
+        elif self.robot_state == TEST_WAIT_FOR_READY:
+            self.handle_test_wait_for_ready()
+
+        elif self.robot_state == FOLLOW_PATH:
+            self.handle_follow_path()
+
     # State handlers
 
     def handle_init(self):
@@ -193,8 +311,14 @@ class ObjectCollector(Node):
             self.get_logger().info("Waiting for SLAM map from /map...")
             return
 
-        self.get_logger().info("SLAM map loaded. Proceeding to localization.")
-        self.robot_state = LOCALIZE_WITH_FILTER
+        self.get_logger().info("SLAM map loaded.")
+        
+        if TEST_MODE:
+            self.get_logger().info("TEST MODE: Going to test flow...")
+            self.robot_state = TEST_WAIT_FOR_READY
+        else:
+            self.get_logger().info("Proceeding to localization.")
+            self.robot_state = LOCALIZE_WITH_FILTER
 
     def handle_particle_filter_localization(self):
         self.get_logger().info("Running particle filter localization...")
@@ -285,6 +409,231 @@ class ObjectCollector(Node):
         self.get_logger().info("Task complete.")
         self.publish_velocity(0.0, 0.0)
 
+    # =========================================================================
+    # TEST MODE HANDLERS
+    # =========================================================================
+
+    def handle_test_wait_for_ready(self):
+        """Wait for map, then allow click-to-path testing."""
+        if not self.map_loaded:
+            self.get_logger().info("TEST: Waiting for map...", throttle_duration_sec=2.0)
+            return
+        
+        if not self.test_prompted:
+            self.test_prompted = True
+            self.get_logger().info("=" * 60)
+            self.get_logger().info("CLICK-TO-PATH TEST MODE READY")
+            self.get_logger().info("=" * 60)
+            self.get_logger().info("In RViz: Use 'Publish Point' tool to click on the map")
+            self.get_logger().info("Robot pose will be used when available")
+            self.get_logger().info("=" * 60)
+        
+        # Stay in this state - clicks are handled by clicked_point_callback
+
+    def handle_test_plan_and_log(self):
+        """Unused - kept for compatibility."""
+        pass
+
+    def handle_follow_path(self):
+        """
+        Follow the planned path waypoint by waypoint.
+        Uses simple proportional control for turning and constant speed for forward motion.
+        """
+        # Safety checks
+        if self.robot_pose is None:
+            self.get_logger().warn("Lost robot pose during path following!", throttle_duration_sec=1.0)
+            self.publish_velocity(0.0, 0.0)
+            return
+        
+        if not self.current_path or self.path_index >= len(self.current_path):
+            self.get_logger().info("Path complete or empty!")
+            self.publish_velocity(0.0, 0.0)
+            self.robot_state = TEST_WAIT_FOR_READY
+            return
+        
+        # Get current position and target waypoint
+        robot_x = self.robot_pose.pose.position.x
+        robot_y = self.robot_pose.pose.position.y
+        robot_yaw = self.get_yaw_from_pose(self.robot_pose.pose)
+        
+        target_x, target_y = self.current_path[self.path_index]
+        
+        # Calculate distance and angle to waypoint
+        dx = target_x - robot_x
+        dy = target_y - robot_y
+        distance = math.sqrt(dx * dx + dy * dy)
+        angle_to_target = math.atan2(dy, dx)
+        
+        # Angle error (wrapped to [-pi, pi])
+        angle_error = self.wrap_angle(angle_to_target - robot_yaw)
+        
+        # Check if we've reached the current waypoint
+        is_final_waypoint = (self.path_index == len(self.current_path) - 1)
+        tolerance = self.goal_tolerance if is_final_waypoint else self.waypoint_tolerance
+        
+        if distance < tolerance:
+            if is_final_waypoint:
+                # Reached final goal!
+                self.get_logger().info("=" * 40)
+                self.get_logger().info("GOAL REACHED!")
+                self.get_logger().info("=" * 40)
+                self.publish_velocity(0.0, 0.0)
+                self.clear_path_visualization()
+                self.current_path = []
+                self.robot_state = TEST_WAIT_FOR_READY
+                return
+            else:
+                # Move to next waypoint
+                self.path_index += 1
+                self.get_logger().info(f"Waypoint {self.path_index}/{len(self.current_path)} reached")
+                return
+        
+        # Debug logging (throttled)
+        self.get_logger().info(
+            f"[{self.path_index}/{len(self.current_path)}] "
+            f"pos=({robot_x:.2f},{robot_y:.2f}) yaw={math.degrees(robot_yaw):.1f}° "
+            f"target=({target_x:.2f},{target_y:.2f}) "
+            f"dist={distance:.2f}m angle_err={math.degrees(angle_error):.1f}°",
+            throttle_duration_sec=0.5
+        )
+        
+        # Control logic: Always move forward, steer proportionally
+        # Proportional steering (gentler gain)
+        angular_vel = max(-self.angular_speed, min(self.angular_speed, angle_error * 0.5))
+        
+        # Always move forward unless angle is very wrong (> 90 degrees)
+        ## > 90 degrees - need to turn more
+        if abs(angle_error) > 1.57:
+            linear_vel = 0.0
+            angular_vel = self.angular_speed if angle_error > 0 else -self.angular_speed
+        ## > 45 degrees - slow down
+        elif abs(angle_error) > 0.8:
+            linear_vel = self.linear_speed * 0.3
+        ## Roughly pointed at target - drive forward
+        else:
+            linear_vel = self.linear_speed
+        
+        self.publish_velocity(linear_vel, angular_vel)
+
+    def get_yaw_from_pose(self, pose):
+        """Extract yaw angle from a Pose quaternion."""
+        q = pose.orientation
+        # Yaw from quaternion: atan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return math.atan2(siny_cosp, cosy_cosp)
+
+    def wrap_angle(self, angle):
+        """Wrap angle to [-pi, pi]."""
+        while angle > math.pi:
+            angle -= 2 * math.pi
+        while angle < -math.pi:
+            angle += 2 * math.pi
+        return angle
+
+    # =========================================================================
+    # VISUALIZATION
+    # =========================================================================
+
+    def publish_goal_marker(self, x, y):
+        """Publish a sphere marker at the goal position."""
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "goal"
+        marker.id = 0
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        
+        marker.pose.position.x = x
+        marker.pose.position.y = y
+        marker.pose.position.z = 0.1
+        marker.pose.orientation.w = 1.0
+        
+        marker.scale.x = 0.2
+        marker.scale.y = 0.2
+        marker.scale.z = 0.2
+        
+        # Green color
+        marker.color.r = 0.0
+        marker.color.g = 1.0
+        marker.color.b = 0.0
+        marker.color.a = 1.0
+        
+        marker.lifetime.sec = 0  # Persistent
+        
+        self.goal_marker_pub.publish(marker)
+
+    def publish_path_visualization(self, path):
+        """Publish the planned path as a line strip marker and nav_msgs/Path."""
+        if not path:
+            return
+        
+        # Publish as LINE_STRIP marker
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "path"
+        marker.id = 0
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        
+        marker.scale.x = 0.05  # Line width
+        
+        # Cyan/blue color
+        marker.color.r = 0.0
+        marker.color.g = 0.8
+        marker.color.b = 1.0
+        marker.color.a = 0.8
+        
+        marker.lifetime.sec = 0  # Persistent
+        
+        # Add all path points
+        for x, y in path:
+            p = Point()
+            p.x = x
+            p.y = y
+            p.z = 0.05
+            marker.points.append(p)
+        
+        self.path_marker_pub.publish(marker)
+        
+        # Also publish as nav_msgs/Path (useful for other tools)
+        path_msg = Path()
+        path_msg.header.frame_id = "map"
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        
+        for x, y in path:
+            pose = PoseStamped()
+            pose.header = path_msg.header
+            pose.pose.position.x = x
+            pose.pose.position.y = y
+            pose.pose.position.z = 0.0
+            pose.pose.orientation.w = 1.0
+            path_msg.poses.append(pose)
+        
+        self.path_pub.publish(path_msg)
+
+    def clear_path_visualization(self):
+        """Clear the path and goal markers."""
+        # Clear goal
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "goal"
+        marker.id = 0
+        marker.action = Marker.DELETE
+        self.goal_marker_pub.publish(marker)
+        
+        # Clear path
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "path"
+        marker.id = 0
+        marker.action = Marker.DELETE
+        self.path_marker_pub.publish(marker)
+
     # Helper functions
  
     def publish_velocity(self, lin, ang):
@@ -293,47 +642,52 @@ class ObjectCollector(Node):
         msg.angular.z = float(ang)
         self.cmd_pub.publish(msg)
 
-    def build_inflated_map(self):
+    def build_obstacle_map(self, inflation_radius_meters=0.18):
         """
-        Build an A* inflated map to make sure pathing stays away from walls.
+        Build a binary obstacle map for A* pathfinding with inflated obstacles.
+        
+        Args:
+            inflation_radius_meters: How much to inflate obstacles (robot radius + safety margin)
+                                    Default 0.25m = ~0.17m robot + 0.08m safety
         """
         if self.map is None:
-            self.get_logger().error("No map available to build inflated map.")
+            self.get_logger().error("No map available to build obstacle map.")
             return
 
         width = self.map.info.width
         height = self.map.info.height
-        res = self.map.info.resolution
+        resolution = self.map.info.resolution
         data = self.map.data
 
-        inflated = [0] * (width * height)
-
-        # Copy map obstacles
-        for i, v in enumerate(data):
-            if v != 0:
-                inflated[i] = 100
-
-        # Determine inflation radius in cells
-        radius_cells = int(self.inflation_radius / res)
-        if radius_cells <= 0:
-            self.inflated_map = inflated
-            return
-
-        # Inflate obstacles
-        for y in range(height):
-            for x in range(width):
-                idx = y * width + x
-                if inflated[idx] == 100:
-                    for dy in range(-radius_cells, radius_cells + 1):
-                        for dx in range(-radius_cells, radius_cells + 1):
-                            nx = x + dx
-                            ny = y + dy
-                            if 0 <= nx < width and 0 <= ny < height:
-                                nidx = ny * width + nx
-                                inflated[nidx] = 100
-
-        self.inflated_map = inflated
-        self.get_logger().info("Inflated A* map built")
+        # Create 2D numpy array from occupancy grid
+        occupancy_2d = np.array(data, dtype=np.int8).reshape((height, width))
+        
+        # Create binary obstacle map (0 = free, 1 = obstacle)
+        # Mark occupied (>50) and unknown (<0) as obstacles
+        obstacle_binary = np.where((occupancy_2d > 50) | (occupancy_2d < 0), 1, 0).astype(np.uint8)
+        
+        # Calculate inflation radius in grid cells
+        inflation_cells = int(math.ceil(inflation_radius_meters / resolution))
+        
+        self.get_logger().info(f"Inflating obstacles by {inflation_radius_meters}m ({inflation_cells} cells)")
+        
+        # Create circular structuring element (kernel) for dilation
+        kernel_size = 2 * inflation_cells + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        
+        # Dilate obstacles (inflate them)
+        inflated_2d = cv2.dilate(obstacle_binary, kernel, iterations=1)
+        
+        # Convert back to 1D list with occupancy values (0 or 100)
+        obstacle_map = (inflated_2d.flatten() * 100).tolist()
+        
+        self.obstacle_map = obstacle_map
+        
+        # Log statistics
+        original_obstacles = np.sum(obstacle_binary)
+        inflated_obstacles = np.sum(inflated_2d)
+        self.get_logger().info(f"Obstacle map built: {original_obstacles} → {inflated_obstacles} cells "
+                              f"({100*inflated_obstacles/(width*height):.1f}% of map)")
 
     def get_neighbors_1d(self, idx):
         """Return indexes of 8 neighbors."""
@@ -368,9 +722,9 @@ class ObjectCollector(Node):
         width  = self.map.info.width
         height = self.map.info.height
 
-        # Make sure inflated map is built
-        if self.inflated_map is None:
-            self.build_inflated_map()
+        # Make sure obstacle map is built
+        if self.obstacle_map is None:
+            self.build_obstacle_map()
 
         # Bounds check
         if not (0 <= start_idx < width * height) or not (0 <= goal_idx < width * height):
@@ -378,10 +732,10 @@ class ObjectCollector(Node):
             return []
 
         # Collision check
-        if self.inflated_map[start_idx] == 100:
+        if self.obstacle_map[start_idx] == 100:
             self.get_logger().error("Start index is an obstacle.")
             return []
-        if self.inflated_map[goal_idx] == 100:
+        if self.obstacle_map[goal_idx] == 100:
             self.get_logger().error("Goal index is an obstacle.")
             return []
 
@@ -423,7 +777,7 @@ class ObjectCollector(Node):
             cy = current // width
 
             for nb in self.get_neighbors_1d(current):
-                if self.inflated_map[nb] == 100:
+                if self.obstacle_map[nb] == 100:
                     continue
 
                 nx = nb % width
@@ -442,8 +796,8 @@ class ObjectCollector(Node):
                     mid1_idx = mid1_y * width + mid1_x
                     mid2_idx = mid2_y * width + mid2_x
 
-                    if (self.inflated_map[mid1_idx] == 100 or
-                        self.inflated_map[mid2_idx] == 100):
+                    if (self.obstacle_map[mid1_idx] == 100 or
+                        self.obstacle_map[mid2_idx] == 100):
                         continue
 
                 base_cost = sqrt2 if diag else 1.0
@@ -478,13 +832,151 @@ class ObjectCollector(Node):
         path.append(cur)
         path.reverse()
         return path
+
+    # =========================================================================
+    # Coordinate Conversion Helpers
+    # =========================================================================
+
+    def world_to_grid(self, x, y):
+        """
+        Convert world coordinates to grid indices.
+        
+        Args:
+            x: X position in meters (map frame)
+            y: Y position in meters (map frame)
+            
+        Returns:
+            (row, col) tuple, or None if out of bounds
+        """
+        if self.map is None:
+            return None
+        
+        res = self.map.info.resolution
+        origin_x = self.map.info.origin.position.x
+        origin_y = self.map.info.origin.position.y
+        
+        col = int(math.floor((x - origin_x) / res))
+        row = int(math.floor((y - origin_y) / res))
+        
+        if row < 0 or col < 0 or row >= self.map.info.height or col >= self.map.info.width:
+            return None
+        
+        return (row, col)
+
+    def grid_to_world(self, row, col):
+        """
+        Convert grid indices to world coordinates (center of cell).
+        
+        Args:
+            row: Grid row index
+            col: Grid column index
+            
+        Returns:
+            (x, y) tuple in meters (map frame)
+        """
+        if self.map is None:
+            return None
+        
+        res = self.map.info.resolution
+        origin_x = self.map.info.origin.position.x
+        origin_y = self.map.info.origin.position.y
+        
+        # +0.5 to get center of cell
+        x = origin_x + (col + 0.5) * res
+        y = origin_y + (row + 0.5) * res
+        
+        return (x, y)
+
+    def grid_to_index(self, row, col):
+        """Convert (row, col) to 1D index."""
+        return row * self.map.info.width + col
+
+    def index_to_grid(self, idx):
+        """Convert 1D index to (row, col)."""
+        width = self.map.info.width
+        return (idx // width, idx % width)
+
+    # =========================================================================
+    # Path Planning Interface
+    # =========================================================================
+
+    def plan_path(self, start, goal):
+        """
+        Plan a path from start to goal using A*.
+                
+        Args:
+            start: (x, y) tuple in meters, or Pose object with .position.x/.y
+            goal:  (x, y) tuple in meters, or Pose object with .position.x/.y
+            
+        Returnss:
+            List of (x, y) waypoints in meters, or empty list if no path found.
+        """
+        if self.map is None:
+            self.get_logger().error("Cannot plan path: no map loaded.")
+            return []
+
+        # Extract coordinates from Pose objects if needed
+        if hasattr(start, 'position'):
+            start = (start.position.x, start.position.y)
+        if hasattr(goal, 'position'):
+            goal = (goal.position.x, goal.position.y)
+
+        # Convert world coords to grid
+        start_grid = self.world_to_grid(start[0], start[1])
+        goal_grid = self.world_to_grid(goal[0], goal[1])
+
+        if start_grid is None:
+            self.get_logger().error(f"Start position {start} is out of map bounds.")
+            return []
+        if goal_grid is None:
+            self.get_logger().error(f"Goal position {goal} is out of map bounds.")
+            return []
+
+        # Convert to 1D indices
+        start_idx = self.grid_to_index(start_grid[0], start_grid[1])
+        goal_idx = self.grid_to_index(goal_grid[0], goal_grid[1])
+
+        # Run A*
+        path_indices = self.astar_indices(start_idx, goal_idx)
+
+        if not path_indices:
+            return []
+
+        # Convert path back to world coordinates
+        path_world = []
+        for idx in path_indices:
+            row, col = self.index_to_grid(idx)
+            world_pos = self.grid_to_world(row, col)
+            if world_pos:
+                path_world.append(world_pos)
+
+        self.get_logger().info(f"Path planned: {len(path_world)} waypoints")
+        return path_world
     
-    
-    
-    
+    def is_valid_goal(self, x, y):
+        """
+        Check if a goal position is reachable (not in obstacle).
+        
+        Args:
+            x, y: Position in meters
+            
+        Returns:
+            True if position is valid for path planning
+        """
+        if self.map is None:
+            return False
+        
+        if self.obstacle_map is None:
+            self.build_obstacle_map()
+        
+        grid = self.world_to_grid(x, y)
+        if grid is None:
+            return False
+        
+        idx = self.grid_to_index(grid[0], grid[1])
+        return self.obstacle_map[idx] != 100
     
     ### WALL FOLLOWER HELPERS AND CODE
-    
     def find_closest_object_angle(self, scan: LaserScan, low: float, high: float) -> tuple[float, float]:
         """
         Finds closest object distance between low and high angles (with 0 being forward), given laser scan data 
@@ -530,6 +1022,7 @@ class ObjectCollector(Node):
 
         
         return (min_dist_angle, min_dist)
+
     def wall_follow_publish(self):
         
         if(self.closest_object_forward):
@@ -558,7 +1051,7 @@ class ObjectCollector(Node):
                 
         if(self.robot_state == WALL_FOLLOW):
             pass
-            
+
 
 def main(args=None):
     rclpy.init(args=args)
