@@ -54,7 +54,7 @@ GRIPPER_CLOSED = -.009
 # Arrays to pass into function to make pos passing easier
 ARM_PICK_UP_JOINT = [PICK_JOINT1, PICK_JOINT2, PICK_JOINT3, PICK_JOINT4]
 ARM_STOW_JOINT = [STOW_JOINT1, STOW_JOINT2, STOW_JOINT3, STOW_JOINT4]
-MOVE = [0.0, 0.0, 0.0, 0.0]
+MOVE = [0.0, -0.2, 0.0, 0.0]
 
 # CONSTANTS
 INIT                           = "INIT"
@@ -100,7 +100,7 @@ class ObjectCollector(Node):
         self.desired_distance = .25
         self.recent_scan = None
         self.counter = 0
-        self.countdown = 100
+        self.countdown = 300
         # State machine
         self.objects_count = 0
         self.robot_state = INIT
@@ -224,6 +224,7 @@ class ObjectCollector(Node):
         self.goal_marker_pub = self.create_publisher(Marker, "/goal_marker", 10)
         self.path_marker_pub = self.create_publisher(Marker, "/planned_path", 10)
         self.path_pub = self.create_publisher(Path, "/astar_path", 10)
+        self.object_marker_pub = self.create_publisher(Marker, "/detected_objects", 10)
         # Arm publishers
         self.gripper_pub = ActionClient(self, GripperCommand, '/gripper_controller/gripper_cmd')
         self.joint_publisher = self.create_publisher(JointTrajectory, '/arm_controller/joint_trajectory', 10)
@@ -234,6 +235,8 @@ class ObjectCollector(Node):
         self.create_timer(0.1, self.state_machine_step)
 
         self.get_logger().info("ObjectCollector Node Initialized")
+
+        self.publish_joint_angles(MOVE)
 
     def pose_callback(self, pose: PoseStamped):
         """
@@ -327,7 +330,7 @@ class ObjectCollector(Node):
         self.closest_object_left = self.find_closest_object_angle(msg,-3 * math.pi / 4, -1 * math.pi/4)
         self.recent_scan = msg
         # Only run wall follow in those specific states (not during path following)
-        if self.robot_state == LOCALIZE_WITH_FILTER or self.robot_state == WALL_FOLLOW:
+        if self.robot_state == WALL_FOLLOW:
             if self.objects_found == 3:
                 self.get_logger().info(f"GOT ALL OBJECTS DOING COUNTDOWN {self.countdown}")
             if self.objects_count == 3 and self.countdown <= 0:
@@ -353,6 +356,14 @@ class ObjectCollector(Node):
                     ob_pose = self.robot_pose
                     self.object_positions[self.target_object] = ob_pose.pose
                     self.get_logger().info(f"GOT OBJECT {self.target_object} POSITION {ob_pose.pose.position.x},{ob_pose.pose.position.y} DISTANCE {dist}")
+                    
+                    # Publish marker to RViz
+                    self.publish_object_marker(
+                        self.target_object,
+                        ob_pose.pose.position.x,
+                        ob_pose.pose.position.y
+                    )
+                    
                     self.objects_count += 1
                     self.target_object = None
                     self.robot_state = WALL_FOLLOW
@@ -362,7 +373,6 @@ class ObjectCollector(Node):
         if (self.robot_state == MOVE_TO_SEEN and forward_obj_dist < self.desired_distance_color):
             
             self.robot_state = PICK_UP_OBJECT
-            self.publish_velocity(0.0,0.0)
             return         
     # State machine
     def state_machine_step(self):
@@ -435,29 +445,23 @@ class ObjectCollector(Node):
             self.get_logger().info("TEST MODE: Going to test flow...")
             self.robot_state = TEST_WAIT_FOR_READY
         else:
-            self.get_logger().info("Proceeding to localization.")
-            self.target_object = 'pink'
+            self.get_logger().info("Starting exploration. Wall following will help particle filter converge.")
             self.send_gripper_command(GRIPPER_OPEN)
             self.publish_joint_angles(MOVE)
-
-            self.robot_state = LOCALIZE_WITH_FILTER
+            # Go directly to wall follow - exploration naturally helps localization
+            self.robot_state = WALL_FOLLOW
 
     def handle_particle_filter_localization(self):
-        self.get_logger().info("Running particle filter localization...")
-        if(self.counter > 5):
-            localization_done = True
-        else:
-            self.counter += 1
-            self.publish_velocity(.1,0) 
-            localization_done = False
-        if localization_done:
-            self.robot_state = WALL_FOLLOW
+        # Not used anymore - wall following handles localization naturally
+        self.robot_state = WALL_FOLLOW
 
     def handle_wall_follow(self):
         if(self.objects_count == 3):
             self.get_logger().info(f"COUNTING DOWN {self.countdown}")
             self.countdown -= 1
-        pass
+        # Debug: log if we're not receiving scans
+        if self.recent_scan is None:
+            self.get_logger().warn("WALL_FOLLOW: No LiDAR scan received yet!", throttle_duration_sec=2.0)
 
     def handle_observe_object(self):
         self.get_logger().info("Observing object...")
@@ -490,6 +494,7 @@ class ObjectCollector(Node):
 
     def handle_navigate_to_object(self):
         self.handle_follow_path()
+
     def handle_move_to_seen_object(self):
         # Finds position of object/tag relative to robot in image
         if self.target_object is not None and self.detected_objects[self.target_object]['found']:
@@ -599,10 +604,12 @@ class ObjectCollector(Node):
         if not self.current_path or self.path_index >= len(self.current_path):
             self.get_logger().info("Path complete or empty!")
             self.publish_velocity(0.0, 0.0)
-            self.robot_state = TEST_WAIT_FOR_READY
+            self.send_gripper_command(GRIPPER_OPEN)
+            self.publish_joint_angles(ARM_PICK_UP_JOINT)
+            self.robot_state = MOVE_TO_SEEN
             return
         
-        # Get current position and target waypoint
+        # Get current position and target waypointf
         robot_x = self.robot_pose.pose.position.x
         robot_y = self.robot_pose.pose.position.y
         robot_yaw = self.get_yaw_from_pose(self.robot_pose.pose)
@@ -631,7 +638,7 @@ class ObjectCollector(Node):
                 self.publish_velocity(0.0, 0.0)
                 self.clear_path_visualization()
                 self.current_path = []
-                self.robot_state = TEST_WAIT_FOR_READY
+                self.robot_state = MOVE_TO_SEEN
                 return
             else:
                 # Move to next waypoint
@@ -785,6 +792,53 @@ class ObjectCollector(Node):
         marker.action = Marker.DELETE
         self.path_marker_pub.publish(marker)
 
+    def publish_object_marker(self, color, x, y):
+        """
+        Publish a colored sphere marker at the detected object's position in RViz.
+        Each color gets a unique ID so markers persist and don't overwrite each other.
+        """
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "detected_objects"
+        
+        # Unique ID per color
+        color_ids = {"pink": 0, "green": 1, "blue": 2}
+        marker.id = color_ids.get(color, 0)
+        
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        
+        marker.pose.position.x = x
+        marker.pose.position.y = y
+        marker.pose.position.z = 0.0
+        marker.pose.orientation.w = 1.0
+        
+        # Sphere size
+        marker.scale.x = 0.15
+        marker.scale.y = 0.15
+        marker.scale.z = 0.15
+        
+        # Set color based on object type
+        if color == "pink":
+            marker.color.r = 1.0
+            marker.color.g = 0.4
+            marker.color.b = 0.7
+        elif color == "green":
+            marker.color.r = 0.0
+            marker.color.g = 1.0
+            marker.color.b = 0.0
+        elif color == "blue":
+            marker.color.r = 0.0
+            marker.color.g = 0.4
+            marker.color.b = 1.0
+        
+        marker.color.a = 1.0  # Fully opaque
+        marker.lifetime.sec = 0  # Persistent
+        
+        self.object_marker_pub.publish(marker)
+        self.get_logger().info(f"Published {color} object marker at ({x:.2f}, {y:.2f})")
+
     # Helper functions
  
     def publish_velocity(self, lin, ang):
@@ -793,7 +847,7 @@ class ObjectCollector(Node):
         msg.angular.z = float(ang)
         self.cmd_pub.publish(msg)
 
-    def build_obstacle_map(self, inflation_radius_meters=0.18):
+    def build_obstacle_map(self, inflation_radius_meters=0.1):
         """
         Build a binary obstacle map for A* pathfinding with inflated obstacles.
         
@@ -1219,7 +1273,6 @@ class ObjectCollector(Node):
         return (min_dist_angle, min_dist)
 
     def wall_follow_publish(self):
-        
         if(self.closest_object_forward):
             lin = 0
             ang = 0
@@ -1243,7 +1296,7 @@ class ObjectCollector(Node):
                     else:
                         ang += .05
                 
-            self.publish_velocity(lin,ang)
+            self.publish_velocity(lin/2,ang/2)
             #self.publish_velocity(0,0)
         else:
             self.get_logger().error("NO CLOSEST OBJECT FORWARD (still None)")
@@ -1259,12 +1312,13 @@ class ObjectCollector(Node):
 
         # converts the incoming ROS message to OpenCV format and HSV
         image = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         self.image_height, self.image_width = image.shape[:2]
+        
         image = image[int(self.image_height * 0.5):self.image_height, 0:self.image_width]
         self.image_height = self.image_height * .5
+     
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         # detect colored tubes
         self.detect_colored_tubes(image, hsv)
         for color, info in self.detected_objects.items():
@@ -1280,15 +1334,12 @@ class ObjectCollector(Node):
                 
         # detect aruco tags (currently not in use)
         # self.detect_aruco_tags(image, gray)
-
         
         # show debug image
         debug_image = self.draw_debug_info(image)
         cv2.imshow("debug_window", debug_image)
         cv2.waitKey(1)
         
-
-                
         # If the robot is looking for an object and has found the object, aligns the robot
         if  self.target_object is not None and self.robot_state == OBSERVE_OBJECT:
             # Gets the position of object in image
@@ -1312,7 +1363,7 @@ class ObjectCollector(Node):
                 self.target_object = None
                 self.robot_state = WALL_FOLLOW
                 
-        if  self.target_object is not None and self.robot_state == NAVIGATE_TO_OBJECT and self.detected_objects[self.target_object]['found']:
+        if  self.target_object is not None and self.robot_state == MOVE_TO_SEEN and self.detected_objects[self.target_object]['found']:
             self.robot_state = ALIGN_WITH_OBJECT
             self.publish_velocity(0.0,0.0)
             # Gets the position of object in image
@@ -1322,9 +1373,6 @@ class ObjectCollector(Node):
             if abs(c_x_obj) < 15:
                 self.publish_velocity(0.0,0.0)
                 self.robot_state = MOVE_TO_SEEN
-                self.send_gripper_command(GRIPPER_OPEN)
-                self.publish_joint_angles(ARM_PICK_UP_JOINT)
-
                 return 
             if self.detected_objects[self.target_object]['found']:
                 # Spins the robot slightly to center it
@@ -1332,14 +1380,11 @@ class ObjectCollector(Node):
             else:
                 self.get_logger().info(f"DOESNT SEE obj")
 
-
-            
-
     def detect_colored_tubes(self, image, hsv):
 
         color_ranges = {'pink': (np.array([150, 180, 180]), np.array([175, 255, 255])),
-                        'green': (np.array([55, 10, 150]), np.array([65, 100, 220])),
-                        'blue': (np.array([85, 90, 90]), np.array([93, 255, 255]))}
+                        'green': (np.array([30, 10, 150]), np.array([50, 160, 220])),
+                        'blue': (np.array([80, 90, 90]), np.array([95, 255, 255]))}
         
         kernel = np.ones((5, 5), np.uint8)
 
@@ -1366,7 +1411,6 @@ class ObjectCollector(Node):
                 cv2.putText(image, f'{color}: {area:.0f}', (cx, cy-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
             else:
                 self.detected_objects[color]['found'] = False
-
 
     def detect_aruco_tags(self, image, gray):
         corners, ids, rejected = cv2.aruco.detectMarkers(gray, self.aruco_dict, parameters=self.aruco_parameters)
