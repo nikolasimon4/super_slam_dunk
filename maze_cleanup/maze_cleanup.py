@@ -178,7 +178,7 @@ class ObjectCollector(Node):
         self.approach_area_threshold = 100 # colored objects
         self.approach_width_threshold = 100 # AR tags
         self.center_threshold = 50 # pixels
-
+        self.aligned = False
         # Subscribers
         self.create_subscription(
             OccupancyGrid,
@@ -370,8 +370,7 @@ class ObjectCollector(Node):
                     return
         forward_obj_ang, forward_obj_dist = self.find_closest_object_angle(msg,-math.pi/20,math.pi/20)
         # If the robot is approaching and within the desired distance stops the robot and updates the state
-        if (self.robot_state == MOVE_TO_SEEN and forward_obj_dist < self.desired_distance_color):
-            
+        if (self.robot_state == MOVE_TO_SEEN and forward_obj_dist < self.desired_distance_color and self.aligned ):  
             self.robot_state = PICK_UP_OBJECT
             return         
     # State machine
@@ -1372,6 +1371,7 @@ class ObjectCollector(Node):
             # If robot is aligned, switches to approaching state and updates arm position to be able to pick up obj
             if abs(c_x_obj) < 15:
                 self.publish_velocity(0.0,0.0)
+                self.aligned = True
                 self.robot_state = MOVE_TO_SEEN
                 return 
             if self.detected_objects[self.target_object]['found']:
