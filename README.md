@@ -400,34 +400,85 @@ state machine.
 | `/estimated_robot_pose` | Estimated robot pose |
 
 ## Execution
-Describe how to run your code, e.g., step-by-step instructions on what commands to run in each terminal window to execute your project code.
 
-### Build
+Run the commands in the order described below (6 Terminals total) also make sure the robot lidar is spinning, and that the arm has a battery, plugged in, and in initial start position
 
+### Build 
+
+### Terminal 1
+(Class 9 instructions)
 ```bash
-cd ~/intro_robo_ws
-colcon build --symlink-install --packages-select maze_cleanup
-source install/setup.bash
+$ cd ~/intro_robo_ws/src
+$ git clone -b humble https://github.com/ROBOTIS-GIT/open_manipulator.git
+$ git clone https://github.com/Intro-Robotics-UChicago-Fall-2025/omx_cpp_interface.git
+$ cd ~/intro_robo_ws
+$ colcon build --symlink-install
+$ source install/setup.bash
 ```
 
-### Terminal 1: Launch RViz
-To show map, particle filter with estimated pose, object locations, and A* paths
+Building our package
 ```bash
+$ cd ~/intro_robo_ws
+$ colcon build --packages-select maze_cleanup
+$ source install/setup.bash
+```
+
+### Particle Filter + RViz Visualization (Terminal 2)
+```bash
+$ cd ~/intro_robo_ws
+$ set_robot_num [robot_num]
 ros2 launch maze_cleanup visualize_particles_launch.py
 ```
+Opens RViz with map, particle cloud (red arrows), and estimated pose (blue arrow).
 
-### Terminal 2: Publish Particles
+By this point you should see a map loaded in the middle of the rviz window.
+
+### Particle Filter Only (Terminal 3)
 ```bash
+$ cd ~/intro_robo_ws
+$ set_robot_num [robot_num]
 ros2 launch maze_cleanup particle_filter_launch.py namespace:=/tbXX
 ```
 
-### Terminal 3: TITLE (state machine? Run Maze Cleanup?)
+Make sure to switch topics for particle filter and estimated robot pose to `/tbxx/topic`
+
+In the Rviz window you should now see the map covered in red arrows (particles).
+
+### Arm Setup (Terminal 4 + 5)
+
+Lab E instructions
+
+Terminal 4:
 ```bash
-ros2 run maze_cleanup maze-cleanup
+$ cd ~/intro_robo_ws
+$ set_robot_num [robot_num]
+$ ssh ubuntu@$ROBOT_IP
+$ sudo dmesg | grep ttyUSB
+```
+After running sudo dmesg | grep ttyUSB look for which USB port the FTDI USB Serial Device is connected to, it should be either ttyUSB0 or ttyUSB1. 
+Now run the bringup command for the arm by specifying the USB port you identified in the prior step.
+```bash
+$ bringup_arm port_name:=/dev/ttyUSB1 
 ```
 
-### Terminal X: OTHER TERMINALS FOR ARMS?
-TODO: Arm stuff!
+Now SSH into the robot and start MoveIt!: ssh into the robot and start MoveIt!.
+
+Terminal 5: 
+```bash
+$ cd ~/intro_robo_ws
+$ set_robot_num [robot_num]
+$ ssh ubuntu@$ROBOT_IP
+$ start_moveit 
+```
+
+### Main State Machine (Terminal 6)
+
+```bash
+$ cd ~/intro_robo_ws
+$ set_robot_num [robot_num]
+$ ros2 run maze_cleanup maze-cleanup
+```
+
 
 ## Challenges
 TODO
