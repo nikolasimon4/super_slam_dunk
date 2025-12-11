@@ -112,7 +112,7 @@ class ObjectCollector(Node):
         self.map = None # Map
         self.obstacle_map = None # Inflated map for A*
         self.desired_distance_color = .35 # Distance for object pickup
-
+        self.path_visualized = False
         # Object tracking
         self.object_positions = {"blue": None, "green": None, "pink": None}
         self.objects_found    = {"blue": False, "green": False, "pink": False}
@@ -244,7 +244,7 @@ class ObjectCollector(Node):
 
         self.get_logger().info("ObjectCollector Node Initialized")
         for ob in OBJECTS:
-          self.publish_object_marker(ob,-2.0,-2.0)
+          self.publish_object_marker(ob,0.0,0.0)
         # Initialize arm position to moving around state
         self.publish_joint_angles(MOVE)
 
@@ -397,7 +397,7 @@ class ObjectCollector(Node):
             self.aligned = False
             return         
           
-        if (self.robot_state == DROP_OBJECT and forward_obj_dist < self.desired_distance_color and self.aligned ):  
+        if (self.robot_state == DROP_OBJECT and forward_obj_dist < self.desired_distance + .07 and self.aligned ):  
             self.get_logger().info("IN DROP OBJECT ALIGNED")
             self.publish_joint_angles(ARM_PICK_UP_JOINT)
             self.gripper_pub(GRIPPER_OPEN)
@@ -527,6 +527,7 @@ class ObjectCollector(Node):
             self.robot_state = WALL_FOLLOW
 
     def handle_navigate_to_object(self):
+      
         self.handle_follow_path()
 
     def handle_move_to_seen_object(self):
@@ -535,15 +536,16 @@ class ObjectCollector(Node):
             self.get_logger().info(f"FOUND OBJECT")
             cx = self.detected_objects[self.target_object]['cx'] - self.image_width / 2
             # Moves robot forward
-            self.publish_velocity(.1 , 0)
+            self.publish_velocity(.05 , 0)
             time.sleep(.1)
             # Attempts to move slowly to keep robot aligned to object
-            self.publish_velocity(0, -(cx / 15))
+            if not (self.closest_object_forward[1] < self.desired_distance_color):
+              self.publish_velocity(0, -(cx / 50))
         else:
             cx = 0
             self.get_logger().info(f"Object/tag not found, target obj {self.target_object}")
             # Rotates until object is found
-            self.publish_velocity(0,.4)
+            self.publish_velocity(0,.2)
 
     def handle_align_with_object(self):
         # Current alignment is done while approaching
@@ -610,12 +612,12 @@ class ObjectCollector(Node):
             self.publish_velocity(.1 , 0)
             time.sleep(.1)
             # Attempts to move slowly to keep robot aligned to object
-            self.publish_velocity(0, -(cx / 25))
+            self.publish_velocity(0, -(cx / 50))
         else:
             cx = 0
             self.get_logger().info(f"Object/tag not found, target obj {self.drop_off_object}")
             # Rotates until object is found
-            self.publish_velocity(0,.4)
+            self.publish_velocity(0,-.2)
 
 
     def handle_task_complete(self):
@@ -657,7 +659,9 @@ class ObjectCollector(Node):
             self.get_logger().warn("Lost robot pose during path following!", throttle_duration_sec=1.0)
             self.publish_velocity(0.0, 0.0)
             return
-        
+        if not self.path_visualized:
+          self.publish_path_visualization(self.current_path)
+          self.path_visualized = True
         if not self.current_path or self.path_index >= len(self.current_path):
             self.get_logger().info("Path complete or empty!")
             self.publish_velocity(0.0, 0.0)
@@ -669,10 +673,13 @@ class ObjectCollector(Node):
                     'green': {'found': False, 'cx': 0, 'cy': 0, 'area': 0},
                     'blue': {'found': False, 'cx': 0, 'cy': 0, 'area': 0}
                 }
-
+                
                 self.robot_state = DROP_OBJECT
             else:
                 self.get_logger().info(f"IN STRANGE STATE IN HANDLE PATH {self.robot_state}")
+            if self.path_visualized:
+              self.clear_path_visualization()
+              self.path_visualized = False
             return
         
         # Get current position and target waypointf
@@ -716,6 +723,9 @@ class ObjectCollector(Node):
                     self.robot_state = DROP_OBJECT
                 else:
                     self.get_logger().info(f"IN STRANGE STATE IN HANDLE PATH {self.robot_state}")
+                if self.path_visualized:
+                  self.clear_path_visualization()
+                  self.path_visualized = False
                 return
             else:
                 # Move to next waypoint
@@ -1468,8 +1478,11 @@ class ObjectCollector(Node):
             else:
                 self.get_logger().info(f"DOESNT SEE obj")
         if  self.drop_off_object is not None and self.robot_state == DROP_OBJECT and self.detected_objects[self.drop_off_object]['found']:
+            if self.aligned:
+              return
             self.publish_velocity(0.0,0.0)
             # Gets the position of object in image
+            
             c_x_obj = self.detected_objects[self.drop_off_object]['cx'] - self.image_width / 2 
             self.get_logger().info(f"Aligning to tag {self.drop_off_object}, angle distance from tag {c_x_obj}")
             # If robot is aligned, switches to approaching state and updates arm position to be able to pick up obj
