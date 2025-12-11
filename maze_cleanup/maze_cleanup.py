@@ -54,24 +54,26 @@ GRIPPER_CLOSED = -.009
 # Arrays to pass into function to make pos passing easier
 ARM_PICK_UP_JOINT = [PICK_JOINT1, PICK_JOINT2, PICK_JOINT3, PICK_JOINT4]
 ARM_STOW_JOINT = [STOW_JOINT1, STOW_JOINT2, STOW_JOINT3, STOW_JOINT4]
+
+# Array for generally moving around (high enough to not hit poles, not high enough to rock robot)
 MOVE = [0.0, -0.2, 0.0, 0.0]
 
 # CONSTANTS
-INIT                           = "INIT"
-LOAD_SLAM_MAP                  = "LOAD_SLAM_MAP"
-LOCALIZE_WITH_FILTER           = "LOCALIZE_WITH_FILTER"
-WALL_FOLLOW                    = "WALL_FOLLOW"
-OBSERVE_OBJECT                 = "OBSERVE_OBJECT"
-WAIT_FOR_TARGET                = "WAIT_FOR_TARGET"
-PLAN_PATH_TO_OBJECT            = "PLAN_PATH_TO_OBJECT"
-NAVIGATE_TO_OBJECT             = "NAVIGATE_TO_OBJECT"
-MOVE_TO_SEEN                   = "MOVE_TO_SEEN"
-ALIGN_WITH_OBJECT              = "ALIGN_WITH_OBJECT"
-PICK_UP_OBJECT                 = "PICK_UP_OBJECT"
-PLAN_PATH_TO_BIN               = "PLAN_PATH_TO_BIN"
-NAVIGATE_TO_BIN                = "NAVIGATE_TO_BIN"
-DROP_OBJECT                    = "DROP_OBJECT"
-TASK_COMPLETE                  = "TASK_COMPLETE"
+INIT                           = "INIT"                       # Initial State
+LOAD_SLAM_MAP                  = "LOAD_SLAM_MAP"              # State for waiting to recieve map
+LOCALIZE_WITH_FILTER           = "LOCALIZE_WITH_FILTER"       # UNUSED state to allow localization (if localization is slow)
+WALL_FOLLOW                    = "WALL_FOLLOW"                # State to follow wall
+OBSERVE_OBJECT                 = "OBSERVE_OBJECT"             # State to observe position of object while wall following
+WAIT_FOR_TARGET                = "WAIT_FOR_TARGET"            # UNUSED state to wait for target object in command line
+PLAN_PATH_TO_OBJECT            = "PLAN_PATH_TO_OBJECT"        # State to handle path planning to object
+NAVIGATE_TO_OBJECT             = "NAVIGATE_TO_OBJECT"         # State for navigating planned path to object
+MOVE_TO_SEEN                   = "MOVE_TO_SEEN"               # State to move to object that has been navigated to
+ALIGN_WITH_OBJECT              = "ALIGN_WITH_OBJECT"          # State to align with object
+PICK_UP_OBJECT                 = "PICK_UP_OBJECT"             # State to pick up object
+PLAN_PATH_TO_BIN               = "PLAN_PATH_TO_BIN"           # State to plan path to bin
+NAVIGATE_TO_BIN                = "NAVIGATE_TO_BIN"            # State for navigating to bin
+DROP_OBJECT                    = "DROP_OBJECT"                # State for seeing, moving toward, and dropping off at bin
+TASK_COMPLETE                  = "TASK_COMPLETE"              # State for a complete task
 
 # Test states
 TEST_WAIT_FOR_READY            = "TEST_WAIT_FOR_READY"
@@ -82,6 +84,8 @@ FOLLOW_PATH                    = "FOLLOW_PATH"
 # When true, skips wall following, prompts for target
 TEST_MODE = False
 
+
+# Object list
 OBJECTS = ["blue", "green", "pink"]
 
 class ObjectCollector(Node):
@@ -97,17 +101,17 @@ class ObjectCollector(Node):
         self.bridge = cv_bridge.CvBridge()
         
         #Wall following
-        self.desired_distance = .25
-        self.recent_scan = None
-        self.counter = 0
-        self.countdown = 150
+        self.desired_distance = .25 # Desired distance for wall following
+        self.recent_scan = None # Most recent scaan data
+        self.counter = 0 # Counts up for if we want some movement before localization
+        self.countdown = 50 # Countdown for movement after all obj found (increase to increase duration)
         # State machine
-        self.objects_count = 0
-        self.robot_state = INIT
-        self.map_loaded = False
-        self.map = None
-        self.obstacle_map = None
-        self.desired_distance_color = .35
+        self.objects_count = 0 # Number of objects found
+        self.robot_state = INIT # Initial robot state
+        self.map_loaded = False # Bool for if the map is loaded
+        self.map = None # Map
+        self.obstacle_map = None # Inflated map for A*
+        self.desired_distance_color = .35 # Distance for object pickup
 
         # Object tracking
         self.object_positions = {"blue": None, "green": None, "pink": None}
@@ -135,11 +139,14 @@ class ObjectCollector(Node):
             2: {'found': False, 'cx': 0, 'cy': 0, 'width': 0},
             3: {'found': False, 'cx': 0, 'cy': 0, 'width': 0}
         }
+        
 
         # Runtime state variables
         self.target_object = None
+        self.drop_off_object = None
         self.current_path = []
         self.has_object = False
+        # Initial Robot Pose for Debugging
         self.robot_pose =PoseStamped() 
         self.robot_pose.pose = Pose()
         self.robot_pose.pose.orientation.w = 0.0
@@ -148,7 +155,11 @@ class ObjectCollector(Node):
         self.robot_pose.pose.orientation.z = 0.0
         self.robot_pose.pose.position.x = -2.0
         self.robot_pose.pose.position.y = -2.0
+
+        # Wall follower angle
         self.safe_angle = -math.pi / 2
+
+        # Variables to store closest objects for detection and wall following
         self.closest_object_forward = None
         self.closest_object_left = None
         
@@ -164,6 +175,8 @@ class ObjectCollector(Node):
         self.angular_speed = 0.4               # Max turning speed
         self.angle_tolerance = 0.4             # Angle error before moving forward (radians)
         
+        
+        # QOS profile for subs/pubs
         qos_profile = QoSProfile(
             depth=1,
             reliability=QoSReliabilityPolicy.RELIABLE,
@@ -172,13 +185,8 @@ class ObjectCollector(Node):
         
         # Tunable constants for image and searching
         self.image_width = 640 # changed later according to the actual received image
-        self.image_height = 480 
-        self.kp_angular = 1.0
-        self.kp_linear = 1.0
-        self.approach_area_threshold = 100 # colored objects
-        self.approach_width_threshold = 100 # AR tags
-        self.center_threshold = 50 # pixels
-        self.aligned = False
+        self.image_height = 480 # changed later
+        self.aligned = False # Value for object pickup when aligned
         # Subscribers
         self.create_subscription(
             OccupancyGrid,
@@ -235,7 +243,9 @@ class ObjectCollector(Node):
         self.create_timer(0.1, self.state_machine_step)
 
         self.get_logger().info("ObjectCollector Node Initialized")
-
+        for ob in OBJECTS:
+          self.publish_object_marker(ob,-2.0,-2.0)
+        # Initialize arm position to moving around state
         self.publish_joint_angles(MOVE)
 
     def pose_callback(self, pose: PoseStamped):
@@ -316,6 +326,7 @@ class ObjectCollector(Node):
         self.publish_path_visualization(path)
         
         self.robot_state = FOLLOW_PATH
+   
     # Map loading
     def get_map_callback(self, msg: OccupancyGrid):
         """Receive a SLAM map from /map and store it."""
@@ -326,33 +337,44 @@ class ObjectCollector(Node):
 
     # Scan callback
     def scan_callback(self, msg):
+        # Values for wall following
         self.closest_object_forward = self.find_closest_object_angle(msg,-math.pi/8,math.pi/8)
         self.closest_object_left = self.find_closest_object_angle(msg,-3 * math.pi / 4, -1 * math.pi/4)
+        
+        # Recent scan stored to allow angled lookups later
         self.recent_scan = msg
         # Only run wall follow in those specific states (not during path following)
         if self.robot_state == WALL_FOLLOW:
+            # Lets robot drive around more after all obj found
             if self.objects_found == 3:
                 self.get_logger().info(f"GOT ALL OBJECTS DOING COUNTDOWN {self.countdown}")
             if self.objects_count == 3 and self.countdown <= 0:
                 self.robot_state = WAIT_FOR_TARGET
                 return
             self.wall_follow_publish()
+        # For alignment during wall follow
         if(self.robot_state == OBSERVE_OBJECT and self.target_object and not self.detected_objects[self.target_object]['found']):
             self.get_logger().info(f"GETTING OBJECT {self.target_object}")
             f_width = math.pi/20 
             
+            # Loop to align
             while(True):
                 ang, dist = self.find_closest_object_angle(msg,-f_width,f_width)
-                if(abs(abs(ang) - f_width) < f_width / 2):
+                # Decreasing angle until there is an object in the middle of the robot's forward looking scan (helps make sure the object is centered)
+                # Not super important currently, but allows accurate object position detection because of accurate pose and distance calcs
+                # Helps prevent color inaccuracies due to the fact that the color tends to jump around as robot rotates to align
+                if(abs(abs(ang) - f_width) <  f_width / 3):
                     self.get_logger().info("Object detected, but currently detecting wall with lidar scan, decreasing forward looking distance")
                     f_width = f_width / 2
                 else:
                     if (dist>= 10):
+                        # Dist becomes an extremely large pos value when find_closest_obj_angle fails
                         self.objects_found[self.target_object] = False
                         self.target_object = None
                         self.robot_state = WALL_FOLLOW
                         self.get_logger().info("Object not aligned, continuing to look")
                         return
+                    # Sets object pose to current robot pose (better for A* pathing)
                     ob_pose = self.robot_pose
                     self.object_positions[self.target_object] = ob_pose.pose
                     self.get_logger().info(f"GOT OBJECT {self.target_object} POSITION {ob_pose.pose.position.x},{ob_pose.pose.position.y} DISTANCE {dist}")
@@ -363,16 +385,25 @@ class ObjectCollector(Node):
                         ob_pose.pose.position.x,
                         ob_pose.pose.position.y
                     )
-                    
+                    # Setting state variables
                     self.objects_count += 1
                     self.target_object = None
                     self.robot_state = WALL_FOLLOW
                     return
         forward_obj_ang, forward_obj_dist = self.find_closest_object_angle(msg,-math.pi/20,math.pi/20)
-        # If the robot is approaching and within the desired distance stops the robot and updates the state
+        # If the robot is approaching object and within the desired distance stops the robot and updates the state
         if (self.robot_state == MOVE_TO_SEEN and forward_obj_dist < self.desired_distance_color and self.aligned ):  
             self.robot_state = PICK_UP_OBJECT
+            self.aligned = False
             return         
+          
+        if (self.robot_state == DROP_OBJECT and forward_obj_dist < self.desired_distance_color and self.aligned ):  
+            self.get_logger().info("IN DROP OBJECT ALIGNED")
+            self.publish_joint_angles(ARM_PICK_UP_JOINT)
+            self.gripper_pub(GRIPPER_OPEN)
+            self.robot_state = TASK_COMPLETE
+            return         
+
     # State machine
     def state_machine_step(self):
 
@@ -452,6 +483,7 @@ class ObjectCollector(Node):
 
     def handle_particle_filter_localization(self):
         # Not used anymore - wall following handles localization naturally
+        # Separate state can be used above to add logic if particle filter isn't fast enough
         self.robot_state = WALL_FOLLOW
 
     def handle_wall_follow(self):
@@ -467,7 +499,9 @@ class ObjectCollector(Node):
         pass
 
     def handle_wait_for_target(self):
+        # Setting variables manually for now
         self.target_object = "pink"
+        self.drop_off_object = "blue"
         if self.target_object is not None:
             self.robot_state = PLAN_PATH_TO_OBJECT
 
@@ -481,42 +515,44 @@ class ObjectCollector(Node):
         if goal is None:
             self.get_logger().error(f"No position for target: {self.target_object}")
             return
-        
+        # Creates path
         self.current_path = self.plan_path(self.robot_pose.pose, goal)
-        
+        # Paths to object
         if self.current_path:
             self.get_logger().info(f"Path to {self.target_object}: {len(self.current_path)} waypoints")
             self.robot_state = NAVIGATE_TO_OBJECT
         else:
             self.get_logger().error("Failed to plan path to object")
-            # TODO: handle failure (eg go back to exploration)
+            self.countdown = 150
+            self.robot_state = WALL_FOLLOW
 
     def handle_navigate_to_object(self):
         self.handle_follow_path()
 
     def handle_move_to_seen_object(self):
         # Finds position of object/tag relative to robot in image
-        if self.target_object is not None and self.detected_objects[self.target_object]['found']:
+        if self.target_object is not None and self.detected_objects[self.target_object]['found'] and self.aligned:
             self.get_logger().info(f"FOUND OBJECT")
             cx = self.detected_objects[self.target_object]['cx'] - self.image_width / 2
             # Moves robot forward
             self.publish_velocity(.1 , 0)
             time.sleep(.1)
             # Attempts to move slowly to keep robot aligned to object
-            self.publish_velocity(0, -(cx / 50))
+            self.publish_velocity(0, -(cx / 15))
         else:
             cx = 0
             self.get_logger().info(f"Object/tag not found, target obj {self.target_object}")
             # Rotates until object is found
-            self.publish_velocity(0,.2)
+            self.publish_velocity(0,.4)
 
     def handle_align_with_object(self):
+        # Current alignment is done while approaching
         refined = True
         if refined:
             self.robot_state = PICK_UP_OBJECT
 
     def handle_pick_up_object(self):
-        # Closes gripper
+        # Opens gripper and ensures that arm is in correct position
         self.send_gripper_command(GRIPPER_OPEN)
         self.publish_joint_angles(ARM_PICK_UP_JOINT)
         time.sleep(1)
@@ -533,36 +569,54 @@ class ObjectCollector(Node):
             self.get_logger().error("Cannot plan: missing robot_pose")
             return
         
-        # TODO: determine bin position based on object color
-        bin_position = Pose()
-        bin_position.position.x = self.robot_pose.pose.position.x - 1.2
-        bin_position.position.y = self.robot_pose.pose.position.y
-        if bin_position is None:
+        # Sets bin position to the target object position
+        bin_position = self.object_positions[self.drop_off_object]
+        self.path_index = 0
+        if bin_position is None:    
             self.get_logger().warning("Bin position not set, skipping to navigate")
+
             self.current_path = self.plan_path(self.robot_pose, bin_position)
             self.robot_state = NAVIGATE_TO_BIN
+
             return
-        
+        self.current_path = []
+        # Gets path
         self.current_path = self.plan_path(self.robot_pose.pose, bin_position)
         
         if self.current_path:
             self.get_logger().info(f"Path to bin: {len(self.current_path)} waypoints")
+            self.robot_state = NAVIGATE_TO_BIN
+
             self.handle_follow_path()
 
-            self.robot_state = NAVIGATE_TO_BIN
         else:
             self.get_logger().error("Failed to plan path to bin")
 
     def handle_navigate_to_bin(self):
+        # Follows path
         self.handle_follow_path()
 
+        # Unused logic, currently state handlign is done in follow_path
         arrived = False
         if arrived:
             self.robot_state = DROP_OBJECT
 
     def handle_drop_object(self):
-        self.has_object = False
-        self.robot_state = TASK_COMPLETE
+        # Finds position of object/tag relative to robot in image
+        if self.drop_off_object is not None and self.detected_objects[self.drop_off_object]['found']:
+            self.get_logger().info(f"FOUND OBJECT")
+            cx = self.detected_objects[self.drop_off_object]['cx'] - self.image_width / 2
+            # Moves robot forward
+            self.publish_velocity(.1 , 0)
+            time.sleep(.1)
+            # Attempts to move slowly to keep robot aligned to object
+            self.publish_velocity(0, -(cx / 25))
+        else:
+            cx = 0
+            self.get_logger().info(f"Object/tag not found, target obj {self.drop_off_object}")
+            # Rotates until object is found
+            self.publish_velocity(0,.4)
+
 
     def handle_task_complete(self):
         self.get_logger().info("Task complete.")
@@ -607,9 +661,18 @@ class ObjectCollector(Node):
         if not self.current_path or self.path_index >= len(self.current_path):
             self.get_logger().info("Path complete or empty!")
             self.publish_velocity(0.0, 0.0)
-            self.send_gripper_command(GRIPPER_OPEN)
-            self.publish_joint_angles(ARM_PICK_UP_JOINT)
-            self.robot_state = MOVE_TO_SEEN
+            if self.robot_state == NAVIGATE_TO_OBJECT:
+                self.robot_state = MOVE_TO_SEEN
+            elif self.robot_state == NAVIGATE_TO_BIN:
+                self.detected_objects = {
+                    'pink': {'found': False, 'cx': 0, 'cy': 0, 'area': 0},
+                    'green': {'found': False, 'cx': 0, 'cy': 0, 'area': 0},
+                    'blue': {'found': False, 'cx': 0, 'cy': 0, 'area': 0}
+                }
+
+                self.robot_state = DROP_OBJECT
+            else:
+                self.get_logger().info(f"IN STRANGE STATE IN HANDLE PATH {self.robot_state}")
             return
         
         # Get current position and target waypointf
@@ -641,9 +704,18 @@ class ObjectCollector(Node):
                 self.publish_velocity(0.0, 0.0)
                 self.clear_path_visualization()
                 self.current_path = []
-                self.robot_state = MOVE_TO_SEEN
-                self.send_gripper_command(GRIPPER_OPEN)
-                self.publish_joint_angles(ARM_PICK_UP_JOINT)
+                if self.robot_state == NAVIGATE_TO_OBJECT:
+                    self.robot_state = MOVE_TO_SEEN
+                elif self.robot_state == NAVIGATE_TO_BIN:
+                    self.detected_objects = {
+                      'pink': {'found': False, 'cx': 0, 'cy': 0, 'area': 0},
+                      'green': {'found': False, 'cx': 0, 'cy': 0, 'area': 0},
+                      'blue': {'found': False, 'cx': 0, 'cy': 0, 'area': 0}
+                    }
+
+                    self.robot_state = DROP_OBJECT
+                else:
+                    self.get_logger().info(f"IN STRANGE STATE IN HANDLE PATH {self.robot_state}")
                 return
             else:
                 # Move to next waypoint
@@ -847,6 +919,7 @@ class ObjectCollector(Node):
     # Helper functions
  
     def publish_velocity(self, lin, ang):
+        "Publishes velocity"
         msg = Twist()
         msg.linear.x = float(lin)
         msg.angular.z = float(ang)
@@ -1303,7 +1376,7 @@ class ObjectCollector(Node):
                     else:
                         ang += .05
                 
-            self.publish_velocity(lin/2,ang/2)
+            self.publish_velocity(lin * 2 / 3,ang *2 /3)
             #self.publish_velocity(0,0)
         else:
             self.get_logger().error("NO CLOSEST OBJECT FORWARD (still None)")
@@ -1332,10 +1405,12 @@ class ObjectCollector(Node):
             if info['found']:    
                 if not self.objects_found[color]:
                     self.get_logger().info(f"color: {color}, cx: {info['cx']}, cy: {info['cy']}, area: {info['area']}")
-                    if(self.robot_state == WALL_FOLLOW or self.robot_state == OBSERVE_OBJECT):
-                      self.target_object = color
+                    if((self.robot_state == WALL_FOLLOW or self.robot_state == OBSERVE_OBJECT or self.robot_state == DROP_OBJECT)):
+                      if(self.target_object == None):
+                        self.target_object = color
                       self.objects_found[color] = True
-                      self.robot_state = OBSERVE_OBJECT
+                      if self.robot_state == WALL_FOLLOW:
+                        self.robot_state = OBSERVE_OBJECT
                       self.publish_velocity(0,0)
                       break
                 
@@ -1376,27 +1451,47 @@ class ObjectCollector(Node):
             c_x_obj = self.detected_objects[self.target_object]['cx'] - self.image_width / 2 
             self.get_logger().info(f"Aligning to tag {self.target_object}, angle distance from tag {c_x_obj}")
             # If robot is aligned, switches to approaching state and updates arm position to be able to pick up obj
-            if abs(c_x_obj) < 15:
+            if abs(c_x_obj) < 10:
                 self.publish_velocity(0.0,0.0)
+                if(not self.aligned):
+                  self.get_logger().info(f"ALIGNED IN Move to seen STATE to {self.drop_off_object}")
+                  self.send_gripper_command(GRIPPER_OPEN)
+                  self.publish_joint_angles(ARM_PICK_UP_JOINT)
+
                 self.aligned = True
-                self.send_gripper_command(GRIPPER_OPEN)
-                self.publish_joint_angles(ARM_PICK_UP_JOINT)
+                
                 self.robot_state = MOVE_TO_SEEN
                 return 
             if self.detected_objects[self.target_object]['found']:
                 # Spins the robot slightly to center it
-                self.publish_velocity(0,-c_x_obj/200)  
+                self.publish_velocity(0,-c_x_obj/50)  
+            else:
+                self.get_logger().info(f"DOESNT SEE obj")
+        if  self.drop_off_object is not None and self.robot_state == DROP_OBJECT and self.detected_objects[self.drop_off_object]['found']:
+            self.publish_velocity(0.0,0.0)
+            # Gets the position of object in image
+            c_x_obj = self.detected_objects[self.drop_off_object]['cx'] - self.image_width / 2 
+            self.get_logger().info(f"Aligning to tag {self.drop_off_object}, angle distance from tag {c_x_obj}")
+            # If robot is aligned, switches to approaching state and updates arm position to be able to pick up obj
+            if abs(c_x_obj) < 10:
+                self.get_logger().info(f"ALIGNED IN DROP OBJECT STATE to {self.drop_off_object}")
+                self.aligned = True
+                return 
+            if self.detected_objects[self.drop_off_object]['found']:
+                # Spins the robot slightly to center it
+                self.publish_velocity(0,-c_x_obj/150)  
             else:
                 self.get_logger().info(f"DOESNT SEE obj")
 
     def detect_colored_tubes(self, image, hsv):
-
+        """ Detects colored tubes from image"""
+        # Color ranges for detection
         color_ranges = {'pink': (np.array([150, 180, 180]), np.array([175, 255, 255])),
                         'green': (np.array([30, 10, 150]), np.array([50, 160, 220])),
                         'blue': (np.array([80, 90, 90]), np.array([95, 255, 255]))}
         
         kernel = np.ones((5, 5), np.uint8)
-
+        # Goes through colors
         for color, (lower, upper) in color_ranges.items():
             mask = cv2.inRange(hsv, lower, upper)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -1408,19 +1503,20 @@ class ObjectCollector(Node):
                 cx = int(M['m10'] / M['m00'])
                 cy = int(M['m01'] / M['m00'])
                 area = M['m00']
-
+                # Updates state dictionary based on mask
                 self.detected_objects[color] = {
                     'found': True,
                     'cx': cx,
                     'cy': cy,
                     'area': area
                 }
-
+                # Debug image for detection
                 cv2.circle(image, (cx, cy), 10, (0, 255, 0), -1)
                 cv2.putText(image, f'{color}: {area:.0f}', (cx, cy-20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
             else:
                 self.detected_objects[color]['found'] = False
-
+    
+    # UNUSED function for integration of AR tags
     def detect_aruco_tags(self, image, gray):
         corners, ids, rejected = cv2.aruco.detectMarkers(gray, self.aruco_dict, parameters=self.aruco_parameters)
 
@@ -1460,7 +1556,7 @@ class ObjectCollector(Node):
 
                     cv2.putText(image, f'Tag {tag_id}: {width:.0f}', (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
-    
+    # Draws debug info onto debug image
     def draw_debug_info(self, image):
         h, w = image.shape[:2]
         cv2.line(image, (w//2, 0), (w//2, h), (255, 0, 0), 2)
