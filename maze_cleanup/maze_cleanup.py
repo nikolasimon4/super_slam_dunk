@@ -100,7 +100,7 @@ class ObjectCollector(Node):
         self.desired_distance = .25
         self.recent_scan = None
         self.counter = 0
-        self.countdown = 300
+        self.countdown = 150
         # State machine
         self.objects_count = 0
         self.robot_state = INIT
@@ -517,6 +517,10 @@ class ObjectCollector(Node):
 
     def handle_pick_up_object(self):
         # Closes gripper
+        self.send_gripper_command(GRIPPER_OPEN)
+        self.publish_joint_angles(ARM_PICK_UP_JOINT)
+        time.sleep(1)
+
         self.send_gripper_command(GRIPPER_CLOSED)
         # Stows gripper
         self.publish_joint_angles(ARM_STOW_JOINT)
@@ -638,6 +642,8 @@ class ObjectCollector(Node):
                 self.clear_path_visualization()
                 self.current_path = []
                 self.robot_state = MOVE_TO_SEEN
+                self.send_gripper_command(GRIPPER_OPEN)
+                self.publish_joint_angles(ARM_PICK_UP_JOINT)
                 return
             else:
                 # Move to next waypoint
@@ -1209,6 +1215,8 @@ class ObjectCollector(Node):
             self.get_logger().error(f"Expected {len(self.joint_names)} joint angles, got {len(joint_angles)}")
             return
 
+        self.get_logger().info(f"Sent joint trajectory: {joint_angles}")
+
         # Constructing joint_trajectory message
         msg = JointTrajectory()
         msg.joint_names = self.joint_names
@@ -1363,7 +1371,6 @@ class ObjectCollector(Node):
                 self.robot_state = WALL_FOLLOW
                 
         if  self.target_object is not None and self.robot_state == MOVE_TO_SEEN and self.detected_objects[self.target_object]['found']:
-            self.robot_state = ALIGN_WITH_OBJECT
             self.publish_velocity(0.0,0.0)
             # Gets the position of object in image
             c_x_obj = self.detected_objects[self.target_object]['cx'] - self.image_width / 2 
@@ -1372,6 +1379,8 @@ class ObjectCollector(Node):
             if abs(c_x_obj) < 15:
                 self.publish_velocity(0.0,0.0)
                 self.aligned = True
+                self.send_gripper_command(GRIPPER_OPEN)
+                self.publish_joint_angles(ARM_PICK_UP_JOINT)
                 self.robot_state = MOVE_TO_SEEN
                 return 
             if self.detected_objects[self.target_object]['found']:
