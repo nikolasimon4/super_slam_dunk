@@ -1,4 +1,5 @@
 # Super Slam Dunk
+Names
 
 ## Project Description
 
@@ -7,7 +8,7 @@ Describe the goal of your project, why it's interesting, what you were able to m
 TODO
 Autonomous maze cleanup robot with particle filter localization,  A* path planning, and color-based object detection.
 
-## Videos
+### Videos
 
 TODO
 
@@ -304,32 +305,31 @@ TODO: Way more ROS nodes!
 ## Execution
 Describe how to run your code, e.g., step-by-step instructions on what commands to run in each terminal window to execute your project code.
 
-TODO
-
 ### Build
 
 ```bash
 cd ~/intro_robo_ws
-colcon build --packages-select maze_cleanup
+colcon build --symlink-install --packages-select maze_cleanup
 source install/setup.bash
 ```
 
-### Particle Filter + RViz Visualization
+### Terminal 1: Launch RViz
+To show map, particle filter with estimated pose, object locations, and A* paths
 ```bash
 ros2 launch maze_cleanup visualize_particles_launch.py
 ```
-Opens RViz with map, particle cloud (red arrows), and estimated pose (blue arrow).
 
-### Particle Filter Only
+### Terminal 2: Publish Particles
 ```bash
 ros2 launch maze_cleanup particle_filter_launch.py namespace:=/tbXX
 ```
 
-### Main State Machine
+### Terminal 3: TITLE (state machine? Run Maze Cleanup?)
 ```bash
 ros2 run maze_cleanup maze-cleanup
 ```
 
+### Terminal X: OTHER TERMINALS FOR ARMS?
 TODO: Arm stuff!
 
 ## Challenges
