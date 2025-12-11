@@ -1,16 +1,30 @@
 # Super Slam Dunk
-Names
+Nikola Simon, Nick Rinaldi, Paulo Rodrigues  
+CMSC 20600: Intro to Robotics  
+Fall 2025  
+Prof. Sarah Sebo
 
 ## Project Description
 
-Describe the goal of your project, why it's interesting, what you were able to make your robot do, and what the main components of your project are and how they fit together - please include diagrams and gifs when appropriate
+The goal of **Super Slam Dunk** is to build an end-to-end autonomous robotics pipeline that combines mapping, perception, planning, and manipulation into a single unified state machine system. 
 
-TODO
-Autonomous maze cleanup robot with particle filter localization,  A* path planning, and color-based object detection.
+Our robot autonomously explores a maze environment, detects colored poles (pink, green, and blue) using its RGB camera, estimates their positions in the map frame by fusing camera bearings with LiDAR range data, and catalogs each object's color and location. Once exploration is complete, the user selects a target color, and the robot uses a custom A\* path planning algorithm to compute a collision-free route to the selected object. The robot then navigates to the object, picks it up with its OpenManipulator arm, plans a path to the appropriate bin, and deposits the object.
+
+This project is interesting because it requires tight integration of multiple robotics subsystems—localization (particle filter), perception (color-based object detection), global planning (A\*), local control (wall following and waypoint tracking), and manipulation (inverse kinematics for the arm)—all coordinated through a robust state machine. The result is a robot that can autonomously "clean up" a maze by finding and relocating objects.
+
+| Component | Description |
+|-----------|-------------|
+| **Particle Filter Localization** | Estimates the robot's pose in the map frame using LiDAR and odometry |
+| **Wall-Following Exploration** | Enables the robot to traverse the maze and discover objects |
+| **Color-Based Object Detection** | Detects pink, green, and blue poles using HSV thresholding in OpenCV |
+| **A\* Path Planning** | Computes shortest collision-free paths on an inflated occupancy grid |
+| **Waypoint Navigation** | Executes planned paths using proportional control |
+| **Arm Manipulation** | Picks up and deposits objects using the OpenManipulator arm |
+| **State Machine** | Coordinates all behaviors and handles transitions and error recovery |
 
 ### Videos
 
-TODO
+*TODO: Add demo GIFs here*
 
 ## System Architecture
 
@@ -430,10 +444,29 @@ ros2 run maze_cleanup maze-cleanup
 TODO: Arm stuff!
 
 ## Challenges
-TODO
+
+**Exploration and perception:** Lighting inconsistencies in the maze made color detection unreliable. Tuning the HSV thresholds to work across different lighting conditions required significant trial and error. Getting the `/map` topic to publish correctly was also difficult, as it would inexplicably not load. Additionally, achieving wall following that was consistent enough to not crash into walls required careful tuning of the proportional controller gains.
+
+**A\* path planning and navigation:** An early challenge was that the robot tended to steer back and forth across the planned path rather than following it smoothly. This oscillation was caused by the waypoint-following controller overshooting each waypoint and then correcting, which we mitigated by tuning the angular gain and increasing the waypoint tolerance.
+
+**Network connection issues:** During the final week of the project, we experienced persistent network connection issues that caused significant latency in the camera feed, LiDAR data, and command execution. Debugging became extremely difficult when sensor data was delayed by hundreds of milliseconds, and we lost many hours to connection drops and reconnection attempts. This was an absolute nightmare and a reminder of how much real-world robotics depends on reliable infrastructure.
 
 ## Future Work
-TODO
+
+Given more time, we would improve object and color detection to be less reliant on lighting conditions—potentially by using a learned model or adaptive thresholding rather than fixed HSV ranges. We would also make wall following faster while maintaining safety, perhaps by implementing a more sophisticated controller (e.g., PID with feedforward) or using a different exploration strategy entirely.
+
+A significant limitation of our current system is that we mark the *robot's* position when it observes an object, not the *object's* actual location. This was a deliberate design choice: marking the true object position would place the goal inside the inflated obstacle region, causing A\* to fail. A better approach would be to mark the actual object locations and modify the A\* algorithm accordingly (for example, planning a path to the nearest free cell adjacent to the goal, rather than requiring the goal itself to be free).
+
+Finally, we would love to extend the system with computer vision to use semantic object recognition (e.g., detecting a sock, a coffee cup) rather than just colored poles. This would make the "cleanup" scenario more realistic and demonstrate the generalizability of our pipeline to real-world tasks.
 
 ## Takeaways
-TODO
+
+**1. State machines are essential for complex autonomy.** Coordinating perception, planning, navigation, and manipulation requires a clear structure for sequencing behaviors and handling failures. Our state machine made it possible to debug individual components in isolation and recover gracefully from errors.
+
+**2. Integration is harder than implementation.** Each component (localization, detection, planning, control, manipulation) worked reasonably well in isolation, but getting them to work together reliably was the bulk of the effort. Timing, coordinate frame consistency, and edge cases dominated our debugging time.
+
+**3. Real-world robotics is unforgiving.** Lighting changes, network latency, sensor noise, and mechanical inconsistencies all caused problems that wouldn't have existed in simulation. Building robust systems requires defensive programming and extensive testing in realistic conditions.
+
+**4. A\* on an inflated map is a powerful and practical approach.** Inflating obstacles *before* planning ensures the robot maintains clearance from walls without needing complex trajectory optimization. The turn penalty heuristic also helped produce smoother, more natural paths.
+
+**5. Visualization is invaluable for debugging.** Publishing markers to RViz for the planned path, goal location, and detected objects made it much easier to understand what the robot was "thinking" and identify bugs in perception and planning.
