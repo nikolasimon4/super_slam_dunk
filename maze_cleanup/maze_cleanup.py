@@ -26,6 +26,10 @@ from control_msgs.action import GripperCommand
 from rclpy.action import ActionClient
 
 
+# Change variables to change targets
+TARGET_COLOR_FOR_BIN = "blue"
+TARGET_OBJECT_FOR_PICKUP = "pink"
+
 # Helper functions
 def get_yaw_from_pose(p: Pose):
     """A helper function that takes in a Pose object (geometry_msgs) and returns yaw."""
@@ -500,8 +504,8 @@ class ObjectCollector(Node):
 
     def handle_wait_for_target(self):
         # Setting variables manually for now
-        self.target_object = "pink"
-        self.drop_off_object = "blue"
+        self.target_object = TARGET_OBJECT_FOR_PICKUP
+        self.drop_off_object = TARGET_COLOR_FOR_BIN
         if self.target_object is not None:
             self.robot_state = PLAN_PATH_TO_OBJECT
 
@@ -547,7 +551,7 @@ class ObjectCollector(Node):
             # Rotates until object is found
             self.publish_velocity(0,.2)
 
-    def handle_align_with_object(self):
+    def handle_align_with_object(self):   
         # Current alignment is done while approaching
         refined = True
         if refined:
@@ -1529,45 +1533,6 @@ class ObjectCollector(Node):
             else:
                 self.detected_objects[color]['found'] = False
     
-    # UNUSED function for integration of AR tags
-    def detect_aruco_tags(self, image, gray):
-        corners, ids, rejected = cv2.aruco.detectMarkers(gray, self.aruco_dict, parameters=self.aruco_parameters)
-
-        for tag_id in [1, 2, 3]:
-            self.detected_tags[tag_id]['found'] = False
-        
-        if ids is not None:
-            cv2.aruco.drawDetectedMarkers(image, corners, ids)
-
-            for i, tag_id in enumerate(ids.flatten()):
-                if tag_id in [1, 2, 3]:
-                    corner_points = corners[i][0]
-
-                    cx = int(np.mean(corner_points[:, 0]))
-                    cy = int(np.mean(corner_points[:, 1]))
-
-                    width = np.linalg.norm(corner_points[0] - corner_points[1])
-
-                    self.detected_tags[tag_id] = {
-                        'found': True,
-                        'cx': cx,
-                        'cy': cy,
-                        'width': width
-                    }
-
-                    if self.has_object and tag_id == self.target_tag and self.initial_tag_position is None:
-                        center_offset = cx - (self.image_width // 2)
-                        if center_offset < -20:
-                            self.initial_tag_position = 'left'
-                            self.get_logger().info(f'Tag {tag_id} initially detected on left')
-                        elif center_offset > 20:
-                            self.initial_tag_position = 'right'
-                            self.get_logger().info(f'Tag {tag_id} initially detected on right')
-                        else:
-                            self.initial_tag_position = 'center'
-                            self.get_logger().info(f'Tag {tag_id} initially detected on center')
-
-                    cv2.putText(image, f'Tag {tag_id}: {width:.0f}', (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
     # Draws debug info onto debug image
     def draw_debug_info(self, image):
